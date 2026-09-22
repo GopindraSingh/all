@@ -1,0 +1,5 @@
+[  ] 15 minute Volume * [  ] 15 minute Close >= 500000000and [  ] 15 minute Close > [  ] 15 minute Openand [  ] 15 minute Close >= [ [  ] 15 minute High + [  ] 15 minute Low ] / 2
+
+
+
+  [ 0 ] 15 minute Volume  *  [ 0 ] 15 minute Close  Greater than  500000000

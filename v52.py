@@ -1,0 +1,5902 @@
+"""
+====================================================================
+NSE INTRADAY 09:45 SHORT-BIASED SCANNER - V4 (UPSTOX DATA)
+====================================================================
+
+V4 OBJECTIVES
+--------------
+Originally designed around the 09:45 IST decision point; V3 also supports rolling live 15-minute scanning.
+
+Signal candles:
+
+    09:15 - 09:30
+    09:30 - 09:45
+
+Decision:
+
+    End of 09:45 candle
+
+V4 IMPROVEMENTS
+----------------
+
+1. Historical indicator warm-up
+   --------------------------------
+   EMA9 / EMA20 / RSI / MACD / ATR are NOT calculated from only
+   the first two candles of the current session.
+
+   Historical 15-minute candles are loaded before the target date.
+
+2. Session VWAP
+   --------------------------------
+   VWAP resets at 09:15 every trading day.
+
+3. Same-time-of-day relative volume
+   --------------------------------
+   Today's 09:15-09:30 volume is compared with historical
+   09:15-09:30 volume.
+
+   Today's 09:30-09:45 volume is compared with historical
+   09:30-09:45 volume.
+
+4. Market-relative strength
+   --------------------------------
+   Stock performance is compared with NIFTY 50 performance.
+
+5. Volatility normalization
+   --------------------------------
+   Movement is normalized using ATR.
+
+6. Reduced correlated scoring
+   --------------------------------
+   VWAP, EMA, MACD, price action etc. are grouped into feature
+   families instead of blindly adding points for every indicator.
+
+7. Continuous scoring
+   --------------------------------
+   Most features contribute smoothly rather than through arbitrary
+   threshold jumps.
+
+8. Exhaustion model
+   --------------------------------
+   RSI, VWAP extension, EMA extension, opening collapse,
+   lower wick and momentum deceleration are treated as exhaustion
+   features.
+
+9. Transaction costs
+   --------------------------------
+   Historical evaluation includes configurable slippage and costs.
+
+10. 1-minute post-entry evaluation
+    --------------------------------
+    If enabled and available, target/stop sequencing is evaluated
+    using 1-minute candles instead of assuming the order inside a
+    15-minute candle.
+
+11. Better statistics
+    --------------------------------
+    Expectancy
+    Win rate
+    Profit factor
+    Average win
+    Average loss
+    MFE
+    MAE
+    Drawdown
+    Net return
+
+IMPORTANT
+---------
+This remains a RESEARCH / SCANNING SYSTEM.
+
+It does NOT guarantee future returns.
+
+Upstox is used as the market-data provider in V3. Upstox V3 historical
+candles support 1-15 minute intervals for about one month, so longer-term
+research should use an appropriate institutional historical database.
+
+====================================================================
+"""
+
+from __future__ import annotations
+
+import contextlib
+import gzip
+import json
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
+from getpass import getpass
+import io
+import math
+import sys
+import time
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import requests
+
+
+# ====================================================================
+# CONFIGURATION
+# ====================================================================
+
+NIFTY_500_URL = (
+    "https://nsearchives.nseindia.com/content/indices/"
+    "ind_nifty500list.csv"
+)
+
+NIFTY_50_URL = (
+    "https://nsearchives.nseindia.com/content/indices/"
+    "ind_nifty50list.csv"
+)
+
+MARKET_TZ = "Asia/Kolkata"
+
+MARKET_OPEN = "09:15"
+OPENING_END = "09:30"
+DECISION_TIME = "09:45"
+MARKET_CLOSE = "15:30"
+
+SIGNAL_INTERVAL = "15m"
+
+# Upstox V3 provides customizable minute intervals.
+UPSTOX_INTERVAL_MINUTES = 15
+UPSTOX_HISTORICAL_DAYS = 29
+UPSTOX_INSTRUMENT_URL = (
+    "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+)
+UPSTOX_INSTRUMENT_CACHE = "upstox_nse_instruments.json"
+UPSTOX_MAX_WORKERS = 20
+UPSTOX_REQUESTS_PER_SECOND = 45
+UPSTOX_REQUESTS_PER_MINUTE = 480
+UPSTOX_REQUEST_TIMEOUT = 20
+UPSTOX_ACCESS_TOKEN_ENV = "UPSTOX_ACCESS_TOKEN"
+UPSTOX_ANALYTICS_TOKEN_ENV = "UPSTOX_ANALYTICS_TOKEN"
+
+# Upstox V3 minute-history availability is approximately one month.
+# 29 calendar days leaves room for indicator warm-up and RVOL history.
+WARMUP_DAYS = UPSTOX_HISTORICAL_DAYS
+
+# Number of previous sessions used for relative volume.
+RVOL_LOOKBACK_DAYS = 20
+
+# Minimum number of positive historical observations used to estimate
+# same-time-of-day relative volume. Missing/zero-volume history does not
+# invalidate the signal; insufficient history falls back to neutral RVOL.
+MIN_RVOL_POSITIVE_OBSERVATIONS = 3
+RVOL_NEUTRAL_FALLBACK = 1.0
+
+
+# ====================================================================
+# UNIVERSE
+# ====================================================================
+
+# The original script removed NIFTY 50 from NIFTY 500.
+# Preserve that behavior by default.
+
+EXCLUDE_NIFTY50 = True
+
+# NOTE:
+# Historical scans using today's index constituents still have
+# survivorship bias.
+#
+# A production research system should replace build_universe()
+# with a historical constituent database.
+
+
+# ====================================================================
+# LIQUIDITY
+# ====================================================================
+
+# Use historical daily traded value for liquidity/capacity screening.
+# The V3 implementation filtered on one 15-minute candle instead.
+MIN_MEDIAN_DAILY_TURNOVER_CR = 20.0
+MIN_MEDIAN_DAILY_VOLUME_LAKH = 2.0
+LIQUIDITY_LOOKBACK_DAYS = 20
+MIN_LIQUIDITY_OBSERVATIONS = 8
+
+
+# ====================================================================
+# INDICATORS
+# ====================================================================
+
+EMA_FAST = 9
+EMA_SLOW = 20
+
+RSI_PERIOD = 14
+
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+
+ATR_PERIOD = 14
+
+
+# ====================================================================
+# SIGNAL THRESHOLDS
+# ====================================================================
+
+SHORT_TRADEABLE_SCORE = 60.0
+
+SHORT_HIGH_CONVICTION_SCORE = 75.0
+
+LONG_TRADEABLE_SCORE = 70.0
+
+LONG_HIGH_CONVICTION_SCORE = 80.0
+
+
+# ====================================================================
+# MOVEMENT REQUIREMENTS
+# ====================================================================
+
+MIN_SHORT_TOTAL_MOVE = 0.30
+
+MIN_LONG_TOTAL_MOVE = 0.50
+
+MIN_OPENING_SHORT_MOVE = 0.25
+
+MIN_OPENING_LONG_MOVE = 0.35
+
+
+# ====================================================================
+# EXHAUSTION
+# ====================================================================
+
+RSI_OVERSOLD = 30.0
+
+RSI_EXTREME_OVERSOLD = 22.0
+
+MAX_SHORT_VWAP_DISTANCE = 3.0
+
+MAX_SHORT_EMA20_DISTANCE = 3.5
+
+MAX_OPENING_COLLAPSE = 3.0
+
+
+# ====================================================================
+# RISK / OUTCOME
+# ====================================================================
+
+TARGET_PCT = 1.00
+
+STOP_PCT = 0.75
+
+# Estimated round-trip trading cost.
+#
+# This is intentionally configurable.
+#
+# Do NOT assume this is your exact Zerodha/Upstox/etc cost.
+# Replace with your actual cost model.
+
+ROUND_TRIP_COST_PCT = 0.10
+
+# Additional slippage per side.
+SLIPPAGE_PER_SIDE_PCT = 0.05
+
+TOTAL_SLIPPAGE_PCT = (
+    SLIPPAGE_PER_SIDE_PCT * 2
+)
+
+
+# ====================================================================
+# HISTORICAL EVALUATION
+# ====================================================================
+
+USE_1M_EVALUATION = True
+
+# Strict research default: do not silently replace 1-minute sequencing
+# with 15-minute bars when fine data is unavailable.
+ALLOW_15M_FALLBACK = False
+
+REQUIRE_COMPLETE_SIGNAL_BARS = True
+ENTRY_BAR_MINUTES = 15
+INSTRUMENT_CACHE_MAX_AGE_HOURS = 24.0
+SCORE_IS_PROBABILITY = False
+
+# Market-relative alpha model. Beta is estimated only from sessions
+# strictly before the target session and uses the same intraday window.
+BETA_LOOKBACK_DAYS = 20
+BETA_MIN_OBSERVATIONS = 10
+BETA_MIN = 0.25
+BETA_MAX = 2.50
+BETA_SHRINK_TO_ONE = 0.50
+
+# In live modes, use the broker intraday endpoint while the market is open.
+# Outside market hours, fall back to completed historical candles for the
+# latest completed session so evening/weekend research remains useful.
+ALLOW_OFF_HOURS_LIVE_FALLBACK = True
+OFF_HOURS_LOOKBACK_DAYS = 7
+
+
+# ====================================================================
+# OUTPUT
+# ====================================================================
+
+TOP_SHORTS_TO_SHOW = 10
+
+TOP_LONGS_TO_SHOW = 10
+
+EXPORT_RESULTS = True
+
+EXPORT_FILENAME = (
+    "nse_0945_scanner_v4_results.csv"
+)
+
+
+# ====================================================================
+# DOWNLOAD
+# ====================================================================
+
+BATCH_SIZE = 40
+
+DOWNLOAD_TIMEOUT = UPSTOX_REQUEST_TIMEOUT
+
+BATCH_DELAY = 0.0
+
+
+# ====================================================================
+# BENCHMARK
+# ====================================================================
+
+NIFTY50_TICKER = "NSE_INDEX|Nifty 50"
+
+
+# ====================================================================
+# DATA CLASS
+# ====================================================================
+
+@dataclass
+class CostModel:
+
+    round_trip_cost_pct: float = (
+        ROUND_TRIP_COST_PCT
+    )
+
+    total_slippage_pct: float = (
+        TOTAL_SLIPPAGE_PCT
+    )
+
+    @property
+    def total_cost_pct(self) -> float:
+
+        return (
+            self.round_trip_cost_pct
+            + self.total_slippage_pct
+        )
+
+
+COST_MODEL = CostModel()
+
+
+# ====================================================================
+# TERMINAL HELPERS
+# ====================================================================
+
+def clear_line() -> None:
+
+    sys.stdout.write(
+        "\r\033[2K"
+    )
+
+    sys.stdout.flush()
+
+
+def progress_line(
+    text: str
+) -> None:
+
+    sys.stdout.write(
+        "\r\033[2K" + text
+    )
+
+    sys.stdout.flush()
+
+
+# ====================================================================
+# DATE
+# ====================================================================
+
+def parse_date(
+    value: str
+) -> pd.Timestamp:
+
+    return pd.to_datetime(
+        value,
+        format="%Y-%m-%d"
+    ).normalize()
+
+
+def ask_date() -> pd.Timestamp:
+
+    while True:
+
+        value = input(
+            "DATE (YYYY-MM-DD): "
+        ).strip()
+
+        try:
+
+            return parse_date(
+                value
+            )
+
+        except ValueError:
+
+            print(
+                "Invalid date. "
+                "Use YYYY-MM-DD."
+            )
+
+
+# ====================================================================
+# NSE UNIVERSE
+# ====================================================================
+
+def download_nse_csv(
+    url: str
+) -> pd.DataFrame:
+
+    headers = {
+
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "Chrome/131.0 Safari/537.36"
+        ),
+
+        "Accept": (
+            "text/csv,application/csv,"
+            "application/octet-stream,*/*"
+        ),
+
+        "Referer": (
+            "https://www.nseindia.com/"
+        ),
+    }
+
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=30
+    )
+
+    response.raise_for_status()
+
+    return pd.read_csv(
+        io.BytesIO(
+            response.content
+        )
+    )
+
+
+def find_symbol_column(
+    df: pd.DataFrame
+) -> str:
+
+    candidates = [
+        "Symbol",
+        "SYMBOL",
+        "symbol",
+        "Ticker",
+        "TICKER",
+    ]
+
+    for column in candidates:
+
+        if column in df.columns:
+
+            return column
+
+    raise ValueError(
+        "Could not find NSE symbol column."
+    )
+
+
+def get_index_symbols(
+    url: str
+) -> set[str]:
+
+    df = download_nse_csv(
+        url
+    )
+
+    column = find_symbol_column(
+        df
+    )
+
+    symbols = (
+        df[column]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    return set(symbols)
+
+
+def build_universe() -> List[str]:
+
+    print(
+        "Downloading NSE universe..."
+    )
+
+    nifty500 = get_index_symbols(
+        NIFTY_500_URL
+    )
+
+    if EXCLUDE_NIFTY50:
+
+        nifty50 = get_index_symbols(
+            NIFTY_50_URL
+        )
+
+        symbols = (
+            nifty500 - nifty50
+        )
+
+    else:
+
+        symbols = nifty500
+
+    tickers = [
+        f"{symbol}.NS"
+        for symbol in sorted(
+            symbols
+        )
+        if symbol
+    ]
+
+    print(
+        f"Universe: {len(tickers)} stocks"
+    )
+
+    return tickers
+
+
+# ====================================================================
+# UPSTOX DATA CLIENT
+# ====================================================================
+
+_UPSTOX_TOKEN = None
+_UPSTOX_SESSION_LOCAL = threading.local()
+_UPSTOX_LIMITER = None
+_UPSTOX_INSTRUMENT_MAP = None
+_FETCH_STATS = {
+    "requests": 0,
+    "errors": 0,
+    "historical_errors": 0,
+    "intraday_errors": 0,
+    "error_samples": [],
+}
+_FETCH_STATS_LOCK = threading.Lock()
+
+_SCAN_STATS = {
+    "ticker_exceptions": 0,
+    "missing_data": 0,
+    "window_failures": 0,
+    "scan_error_samples": [],
+}
+_SCAN_STATS_LOCK = threading.Lock()
+
+def _record_scan_error(ticker: str, stage: str, error: str) -> None:
+    with _SCAN_STATS_LOCK:
+        _SCAN_STATS["ticker_exceptions"] += 1
+        samples = _SCAN_STATS.setdefault("scan_error_samples", [])
+        if len(samples) < 20:
+            samples.append({
+                "ticker": ticker,
+                "stage": stage,
+                "error": error[:400],
+            })
+
+def _record_scan_stat(key: str, amount: int = 1) -> None:
+    with _SCAN_STATS_LOCK:
+        _SCAN_STATS[key] = _SCAN_STATS.get(key, 0) + amount
+
+def get_scan_stats() -> dict:
+    with _SCAN_STATS_LOCK:
+        return dict(_SCAN_STATS)
+
+
+def _record_fetch_stat(key: str, amount: int = 1) -> None:
+    with _FETCH_STATS_LOCK:
+        _FETCH_STATS[key] = _FETCH_STATS.get(key, 0) + amount
+
+
+def get_fetch_stats() -> dict:
+    with _FETCH_STATS_LOCK:
+        return dict(_FETCH_STATS)
+
+
+class UpstoxRateLimiter:
+
+    def __init__(self, per_second: int, per_minute: int):
+
+        self.per_second = per_second
+        self.per_minute = per_minute
+        self.lock = threading.Lock()
+        self.starts = deque()
+
+    def acquire(self) -> None:
+
+        while True:
+
+            with self.lock:
+
+                now = time.monotonic()
+
+                while self.starts and now - self.starts[0] >= 60.0:
+                    self.starts.popleft()
+
+                if len(self.starts) >= self.per_minute:
+                    sleep_for = 60.0 - (now - self.starts[0]) + 0.001
+                else:
+                    recent_second = [
+                        ts for ts in self.starts
+                        if now - ts < 1.0
+                    ]
+                    if len(recent_second) >= self.per_second:
+                        sleep_for = 1.0 - (now - recent_second[0]) + 0.001
+                    else:
+                        self.starts.append(now)
+                        return
+            time.sleep(max(sleep_for, 0.001))
+
+
+def get_upstox_token() -> str:
+
+    global _UPSTOX_TOKEN, _UPSTOX_LIMITER
+
+    if _UPSTOX_TOKEN:
+        return _UPSTOX_TOKEN
+
+    # Prefer the long-lived read-only Analytics Token when supplied.
+    # Standard OAuth access tokens expire at 03:30 AM the following day.
+    token = os.getenv(UPSTOX_ANALYTICS_TOKEN_ENV, "").strip()
+    token_source = "UPSTOX_ANALYTICS_TOKEN"
+
+    if not token:
+        token = os.getenv(UPSTOX_ACCESS_TOKEN_ENV, "").strip()
+        token_source = "UPSTOX_ACCESS_TOKEN"
+
+    if not token:
+        print()
+        print("Upstox token is required.")
+        print("Preferred: set UPSTOX_ANALYTICS_TOKEN (long-lived read-only token).")
+        print("Alternative: set UPSTOX_ACCESS_TOKEN (standard daily token).")
+        token = getpass("UPSTOX TOKEN: ").strip()
+        token_source = "interactive"
+
+    if not token:
+        raise RuntimeError("No Upstox token supplied.")
+
+    print(f"Using Upstox token source: {token_source}")
+
+    if not token:
+        raise RuntimeError(
+            "No Upstox access token supplied. "
+            "Generate an access token from your Upstox developer app."
+        )
+
+    _UPSTOX_TOKEN = token
+    _UPSTOX_LIMITER = UpstoxRateLimiter(
+        UPSTOX_REQUESTS_PER_SECOND,
+        UPSTOX_REQUESTS_PER_MINUTE
+    )
+
+    return _UPSTOX_TOKEN
+
+
+def get_upstox_session() -> requests.Session:
+
+    session = getattr(
+        _UPSTOX_SESSION_LOCAL,
+        "session",
+        None
+    )
+
+    if session is None:
+
+        session = requests.Session()
+
+        session.headers.update({
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        })
+
+        _UPSTOX_SESSION_LOCAL.session = session
+
+    return session
+
+
+def upstox_request(
+    url: str,
+    params: Optional[dict] = None
+) -> dict:
+
+    token = get_upstox_token()
+
+    if _UPSTOX_LIMITER is None:
+        raise RuntimeError("Upstox rate limiter is not initialized.")
+
+    _UPSTOX_LIMITER.acquire()
+
+    _record_fetch_stat("requests")
+
+    response = get_upstox_session().get(
+        url,
+        params=params,
+        headers={
+            "Authorization": f"Bearer {token}",
+        },
+        timeout=UPSTOX_REQUEST_TIMEOUT,
+    )
+
+    if response.status_code != 200:
+        _record_fetch_stat("errors")
+
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text[:500]
+
+        if response.status_code in (401, 403):
+            raise RuntimeError(
+                "Upstox authentication failed "
+                f"(HTTP {response.status_code}). "
+                "The token is invalid/expired or lacks the required market-data scope. "
+                "Standard OAuth tokens expire at 03:30 AM the following day; "
+                "prefer a long-lived Analytics Token for this scanner. "
+                f"Server response: {detail}"
+            )
+
+        raise RuntimeError(
+            f"Upstox HTTP {response.status_code}: {detail}"
+        )
+
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Upstox returned HTTP 200 but invalid JSON: {exc}"
+        ) from exc
+
+    if payload.get("status") != "success":
+        errors = payload.get("errors")
+        detail = errors if errors is not None else payload
+        raise RuntimeError(
+            f"Upstox returned non-success response: {detail}"
+        )
+
+    return payload
+
+
+def download_upstox_instruments() -> Dict[str, str]:
+
+    global _UPSTOX_INSTRUMENT_MAP
+
+    if _UPSTOX_INSTRUMENT_MAP is not None:
+        return _UPSTOX_INSTRUMENT_MAP
+
+    cache_path = UPSTOX_INSTRUMENT_CACHE
+    records = None
+
+    # Use the local cache only while it is fresh.
+    cache_fresh = False
+    if os.path.exists(cache_path):
+        try:
+            age_hours = (time.time() - os.path.getmtime(cache_path)) / 3600.0
+            cache_fresh = age_hours <= INSTRUMENT_CACHE_MAX_AGE_HOURS
+        except OSError:
+            cache_fresh = False
+
+    if cache_fresh:
+        try:
+            with open(cache_path, "r", encoding="utf-8") as handle:
+                records = json.load(handle)
+        except Exception:
+            records = None
+
+    # Download the official NSE instrument master when cache is absent/stale.
+    if records is None:
+
+        response = requests.get(
+            UPSTOX_INSTRUMENT_URL,
+            timeout=30,
+        )
+        response.raise_for_status()
+        with gzip.GzipFile(fileobj=io.BytesIO(response.content)) as gz:
+            records = json.loads(gz.read().decode("utf-8"))
+        try:
+            with open(cache_path, "w", encoding="utf-8") as handle:
+                json.dump(records, handle)
+        except Exception:
+            pass
+
+    mapping: Dict[str, str] = {}
+
+    for item in records:
+
+        if not isinstance(item, dict):
+            continue
+
+        if item.get("segment") != "NSE_EQ":
+            continue
+
+        symbol = str(
+            item.get("trading_symbol", "")
+        ).strip().upper()
+
+        instrument_key = str(
+            item.get("instrument_key", "")
+        ).strip()
+
+        if not symbol or not instrument_key:
+            continue
+
+        # Prefer normal EQ contracts when the symbol appears more than once.
+        instrument_type = str(
+            item.get("instrument_type", "")
+        ).upper()
+
+        if symbol not in mapping:
+            mapping[symbol] = instrument_key
+        elif instrument_type == "EQ":
+            mapping[symbol] = instrument_key
+
+    if not mapping:
+        raise RuntimeError(
+            "Upstox NSE instrument master returned no NSE_EQ instruments."
+        )
+
+    _UPSTOX_INSTRUMENT_MAP = mapping
+
+    print(
+        f"Upstox instrument map: {len(mapping)} NSE equities"
+    )
+
+    return mapping
+
+
+def ticker_to_instrument_key(ticker: str) -> Optional[str]:
+
+    symbol = ticker.replace(".NS", "").strip().upper()
+
+    return download_upstox_instruments().get(symbol)
+
+
+def parse_upstox_candles(payload: dict) -> pd.DataFrame:
+
+    candles = (
+        payload
+        .get("data", {})
+        .get("candles", [])
+    )
+
+    if not candles:
+        return pd.DataFrame()
+
+    rows = []
+
+    for candle in candles:
+
+        if len(candle) < 6:
+            continue
+
+        rows.append({
+            "Timestamp": candle[0],
+            "Open": candle[1],
+            "High": candle[2],
+            "Low": candle[3],
+            "Close": candle[4],
+            "Volume": candle[5],
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    df["Timestamp"] = pd.to_datetime(
+        df["Timestamp"],
+        errors="coerce",
+    )
+    df = df.dropna(
+        subset=["Timestamp"]
+    ).set_index("Timestamp")
+
+    if getattr(df.index, "tz", None) is None:
+        df.index = df.index.tz_localize(MARKET_TZ)
+    else:
+        df.index = df.index.tz_convert(MARKET_TZ)
+
+    for column in [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+    ]:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce"
+        )
+
+    df = df.dropna(
+        subset=[
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Volume",
+        ]
+    )
+
+    df = df[
+        (df["Open"] > 0)
+        & (df["High"] > 0)
+        & (df["Low"] > 0)
+        & (df["Close"] > 0)
+        & (df["High"] >= df["Low"])
+    ]
+
+    return df.sort_index()
+
+
+def download_upstox_historical(
+    instrument_key: str,
+    to_date: pd.Timestamp,
+    from_date: Optional[pd.Timestamp] = None,
+    interval_minutes: int = UPSTOX_INTERVAL_MINUTES,
+) -> pd.DataFrame:
+
+    if from_date is None:
+        from_date = (
+            to_date
+            - pd.Timedelta(days=UPSTOX_HISTORICAL_DAYS)
+        )
+
+    url = (
+        "https://api.upstox.com/v3/historical-candle/"
+        f"{requests.utils.quote(instrument_key, safe='')}/minutes/"
+        f"{interval_minutes}/"
+        f"{to_date:%Y-%m-%d}/"
+        f"{from_date:%Y-%m-%d}"
+    )
+
+    try:
+        payload = upstox_request(url)
+    except Exception as exc:
+        _record_fetch_stat("historical_errors")
+        _record_fetch_error("historical", instrument_key, str(exc))
+        return pd.DataFrame()
+
+    return parse_upstox_candles(payload)
+
+
+def download_upstox_intraday(
+    instrument_key: str,
+    interval_minutes: int = UPSTOX_INTERVAL_MINUTES,
+) -> pd.DataFrame:
+
+    # Upstox V3 explicitly provides this endpoint for the CURRENT
+    # trading day. Do not use the historical endpoint for live data.
+    url = (
+        "https://api.upstox.com/v3/historical-candle/intraday/"
+        f"{requests.utils.quote(instrument_key, safe='')}/minutes/"
+        f"{interval_minutes}"
+    )
+
+    try:
+        payload = upstox_request(url)
+    except Exception as exc:
+        _record_fetch_stat("intraday_errors")
+        _record_fetch_error("intraday", instrument_key, str(exc))
+        return pd.DataFrame()
+
+    return parse_upstox_candles(payload)
+
+
+def _record_fetch_error(
+    endpoint_type: str,
+    instrument_key: str,
+    error: str,
+) -> None:
+    """Retain a small diagnostic sample without flooding stdout."""
+    with _FETCH_STATS_LOCK:
+        samples = _FETCH_STATS.setdefault("error_samples", [])
+        if len(samples) < 10:
+            samples.append({
+                "type": endpoint_type,
+                "instrument_key": instrument_key,
+                "error": error[:400],
+            })
+
+
+def merge_market_data(
+    historical_df: pd.DataFrame,
+    intraday_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Merge warm-up history with current-day intraday candles."""
+    frames = [df for df in (historical_df, intraday_df) if df is not None and not df.empty]
+    if not frames:
+        return pd.DataFrame()
+
+    merged = pd.concat(frames, axis=0)
+    merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+    return merged
+
+
+# ====================================================================
+# DOWNLOAD 15M DATA
+# ====================================================================
+
+def download_intraday_batch(
+    tickers: List[str],
+    target_date: pd.Timestamp,
+    live_mode: bool = False,
+) -> Dict[str, pd.DataFrame]:
+
+    instrument_map = download_upstox_instruments()
+
+    # Historical warm-up is still required in live mode. However, the
+    # CURRENT DAY must come from Upstox's V3 intraday endpoint.
+    from_date = target_date - pd.Timedelta(days=WARMUP_DAYS)
+    previous_day = target_date - pd.Timedelta(days=1)
+
+    results: Dict[str, pd.DataFrame] = {}
+
+    def fetch_one(ticker: str) -> Tuple[str, pd.DataFrame]:
+
+        symbol = ticker.replace(".NS", "").upper()
+        instrument_key = instrument_map.get(symbol)
+
+        if not instrument_key:
+            return ticker, pd.DataFrame()
+
+        if live_mode:
+            # Historical endpoint: warm-up only through the previous day.
+            historical_df = download_upstox_historical(
+                instrument_key,
+                previous_day,
+                from_date=from_date,
+                interval_minutes=UPSTOX_INTERVAL_MINUTES,
+            )
+
+            # Intraday endpoint: current trading day only.
+            current_day_df = download_upstox_intraday(
+                instrument_key,
+                interval_minutes=UPSTOX_INTERVAL_MINUTES,
+            )
+
+            return ticker, merge_market_data(
+                historical_df,
+                current_day_df,
+            )
+
+        df = download_upstox_historical(
+            instrument_key,
+            target_date,
+            from_date=from_date,
+            interval_minutes=UPSTOX_INTERVAL_MINUTES,
+        )
+
+        return ticker, df
+
+    with ThreadPoolExecutor(
+        max_workers=UPSTOX_MAX_WORKERS
+    ) as executor:
+
+        future_to_ticker = {
+            executor.submit(fetch_one, ticker): ticker
+            for ticker in tickers
+        }
+
+        for future in as_completed(future_to_ticker):
+
+            ticker = future_to_ticker[future]
+
+            try:
+                _, df = future.result()
+            except Exception as exc:
+                _record_scan_error(ticker, "download_batch_future", str(exc))
+                continue
+
+            if not df.empty:
+                results[ticker] = df
+            else:
+                _record_scan_stat("missing_data")
+
+    return results
+
+
+# ====================================================================
+# COLUMN HANDLING
+# ====================================================================
+
+def flatten_columns(
+    df: pd.DataFrame
+) -> pd.DataFrame:
+
+    if isinstance(
+        df.columns,
+        pd.MultiIndex
+    ):
+
+        df.columns = (
+            df.columns
+            .get_level_values(0)
+        )
+
+    return df
+
+
+# ====================================================================
+# INDEX NORMALIZATION
+# ====================================================================
+
+def normalize_intraday_index(
+    df: pd.DataFrame
+) -> pd.DataFrame:
+
+    if df.empty:
+
+        return df
+
+    df = df.copy()
+
+    df.index = pd.to_datetime(
+        df.index
+    )
+
+    if getattr(
+        df.index,
+        "tz",
+        None
+    ) is not None:
+
+        df.index = (
+            df.index
+            .tz_convert(
+                MARKET_TZ
+            )
+        )
+
+    else:
+
+        df.index = (
+            df.index
+            .tz_localize(
+                MARKET_TZ
+            )
+        )
+
+    return df.sort_index()
+
+
+# ====================================================================
+# CLEAN OHLCV
+# ====================================================================
+
+def clean_ticker_data(
+    df: pd.DataFrame
+) -> pd.DataFrame:
+
+    if (
+        df is None
+        or df.empty
+    ):
+
+        return pd.DataFrame()
+
+    df = df.copy()
+
+    df = flatten_columns(
+        df
+    )
+
+    required = [
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+    ]
+
+    for column in required:
+
+        if column not in df.columns:
+
+            return pd.DataFrame()
+
+    df = df[
+        required
+    ].copy()
+
+    df = normalize_intraday_index(
+        df
+    )
+
+    for column in required:
+
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce"
+        )
+
+    df = df.dropna(
+        subset=required
+    )
+
+    # Remove impossible rows.
+    df = df[
+        (df["Open"] > 0)
+        & (df["High"] > 0)
+        & (df["Low"] > 0)
+        & (df["Close"] > 0)
+        & (df["High"] >= df["Low"])
+    ]
+
+    return df.sort_index()
+
+
+# ====================================================================
+# SESSION FILTER
+# ====================================================================
+
+def filter_session(
+    df: pd.DataFrame,
+    target_date: pd.Timestamp
+) -> pd.DataFrame:
+
+    if df.empty:
+
+        return df
+
+    date_str = (
+        target_date.strftime(
+            "%Y-%m-%d"
+        )
+    )
+
+    session_open = pd.Timestamp(
+        f"{date_str} {MARKET_OPEN}",
+        tz=MARKET_TZ
+    )
+
+    session_close = pd.Timestamp(
+        f"{date_str} {MARKET_CLOSE}",
+        tz=MARKET_TZ
+    )
+
+    return df[
+        (df.index >= session_open)
+        &
+        (df.index < session_close)
+    ].sort_index()
+
+
+# ====================================================================
+# SIGNAL WINDOW / LIQUIDITY VALIDATION
+# ====================================================================
+
+def expected_0945_timestamps(target_date: pd.Timestamp) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    date_str = target_date.strftime("%Y-%m-%d")
+    first = pd.Timestamp(f"{date_str} {MARKET_OPEN}", tz=MARKET_TZ)
+    second = first + pd.Timedelta(minutes=ENTRY_BAR_MINUTES)
+    return first, second
+
+
+def validate_fixed_signal_window(session: pd.DataFrame, target_date: pd.Timestamp) -> bool:
+    first_ts, second_ts = expected_0945_timestamps(target_date)
+    if first_ts not in session.index or second_ts not in session.index:
+        return False
+    return second_ts == first_ts + pd.Timedelta(minutes=ENTRY_BAR_MINUTES)
+
+
+def calculate_median_daily_liquidity(
+    df: pd.DataFrame,
+    target_date: pd.Timestamp,
+) -> Tuple[float, float]:
+    """Return median historical daily traded value (Cr) and volume (lakh shares)."""
+    if df.empty:
+        return np.nan, np.nan
+
+    historical = df[df.index.date < target_date.date()].copy()
+    if historical.empty:
+        return np.nan, np.nan
+
+    session_open = pd.Timestamp(MARKET_OPEN).time()
+    session_close = pd.Timestamp(MARKET_CLOSE).time()
+    historical = historical[
+        (historical.index.time >= session_open)
+        & (historical.index.time < session_close)
+    ]
+    if historical.empty:
+        return np.nan, np.nan
+
+    daily_value = (
+        historical["Close"] * historical["Volume"]
+    ).groupby(historical.index.date).sum()
+    daily_volume = historical["Volume"].groupby(historical.index.date).sum()
+
+    valid_dates = daily_value[daily_value > 0].index
+    daily_value = daily_value.loc[valid_dates].tail(LIQUIDITY_LOOKBACK_DAYS)
+    daily_volume = daily_volume.reindex(daily_value.index)
+
+    if len(daily_value) < MIN_LIQUIDITY_OBSERVATIONS:
+        return np.nan, np.nan
+
+    return (
+        float(daily_value.median() / 10_000_000.0),
+        float(daily_volume.median() / 100_000.0),
+    )
+
+
+# ====================================================================
+# SESSION VWAP
+# ====================================================================
+
+def calculate_session_vwap(
+    df: pd.DataFrame
+) -> pd.Series:
+
+    typical_price = (
+        df["High"]
+        + df["Low"]
+        + df["Close"]
+    ) / 3.0
+
+    cumulative_pv = (
+        typical_price
+        * df["Volume"]
+    ).cumsum()
+
+    cumulative_volume = (
+        df["Volume"]
+        .cumsum()
+    )
+
+    return (
+        cumulative_pv
+        /
+        cumulative_volume.replace(
+            0,
+            np.nan
+        )
+    )
+
+
+# ====================================================================
+# RSI
+# ====================================================================
+
+def calculate_rsi(
+    close: pd.Series,
+    period: int = RSI_PERIOD
+) -> pd.Series:
+
+    delta = close.diff()
+
+    gain = delta.clip(
+        lower=0
+    )
+
+    loss = -delta.clip(
+        upper=0
+    )
+
+    avg_gain = (
+        gain
+        .ewm(
+            alpha=1 / period,
+            adjust=False,
+            min_periods=period
+        )
+        .mean()
+    )
+
+    avg_loss = (
+        loss
+        .ewm(
+            alpha=1 / period,
+            adjust=False,
+            min_periods=period
+        )
+        .mean()
+    )
+
+    rs = (
+        avg_gain
+        /
+        avg_loss.replace(
+            0,
+            np.nan
+        )
+    )
+
+    rsi = (
+        100
+        -
+        100 / (1 + rs)
+    )
+
+    # Handle zero-loss case.
+    rsi = rsi.where(
+        avg_loss != 0,
+        100
+    )
+
+    return rsi
+
+
+# ====================================================================
+# MACD
+# ====================================================================
+
+def calculate_macd(
+    close: pd.Series
+) -> Tuple[
+    pd.Series,
+    pd.Series,
+    pd.Series
+]:
+
+    ema_fast = (
+        close
+        .ewm(
+            span=MACD_FAST,
+            adjust=False,
+            min_periods=MACD_FAST
+        )
+        .mean()
+    )
+
+    ema_slow = (
+        close
+        .ewm(
+            span=MACD_SLOW,
+            adjust=False,
+            min_periods=MACD_SLOW
+        )
+        .mean()
+    )
+
+    macd = (
+        ema_fast
+        - ema_slow
+    )
+
+    signal = (
+        macd
+        .ewm(
+            span=MACD_SIGNAL,
+            adjust=False,
+            min_periods=MACD_SIGNAL
+        )
+        .mean()
+    )
+
+    histogram = (
+        macd
+        - signal
+    )
+
+    return (
+        macd,
+        signal,
+        histogram
+    )
+
+
+# ====================================================================
+# ATR
+# ====================================================================
+
+def calculate_atr(
+    df: pd.DataFrame,
+    period: int = ATR_PERIOD
+) -> pd.Series:
+
+    previous_close = (
+        df["Close"]
+        .shift(1)
+    )
+
+    tr1 = (
+        df["High"]
+        - df["Low"]
+    )
+
+    tr2 = (
+        df["High"]
+        - previous_close
+    ).abs()
+
+    tr3 = (
+        df["Low"]
+        - previous_close
+    ).abs()
+
+    true_range = pd.concat(
+        [
+            tr1,
+            tr2,
+            tr3,
+        ],
+        axis=1
+    ).max(
+        axis=1
+    )
+
+    return (
+        true_range
+        .ewm(
+            alpha=1 / period,
+            adjust=False,
+            min_periods=period
+        )
+        .mean()
+    )
+
+
+# ====================================================================
+# ADD HISTORICAL INDICATORS
+# ====================================================================
+
+def add_historical_indicators(
+    df: pd.DataFrame
+) -> pd.DataFrame:
+
+    df = df.copy()
+
+    df["EMA9"] = (
+        df["Close"]
+        .ewm(
+            span=EMA_FAST,
+            adjust=False,
+            min_periods=EMA_FAST
+        )
+        .mean()
+    )
+
+    df["EMA20"] = (
+        df["Close"]
+        .ewm(
+            span=EMA_SLOW,
+            adjust=False,
+            min_periods=EMA_SLOW
+        )
+        .mean()
+    )
+
+    df["RSI"] = calculate_rsi(
+        df["Close"]
+    )
+
+    (
+        df["MACD"],
+        df["MACD_Signal"],
+        df["MACD_Hist"]
+    ) = calculate_macd(
+        df["Close"]
+    )
+
+    df["ATR"] = calculate_atr(
+        df
+    )
+
+    df["ATR_Pct"] = (
+        df["ATR"]
+        / df["Close"]
+    ) * 100
+
+    return df
+
+
+# ====================================================================
+# CANDLE FEATURES
+# ====================================================================
+
+def add_candle_features(
+    df: pd.DataFrame
+) -> pd.DataFrame:
+
+    df = df.copy()
+
+    candle_range = (
+        df["High"]
+        - df["Low"]
+    ).replace(
+        0,
+        np.nan
+    )
+
+    body = (
+        df["Close"]
+        - df["Open"]
+    )
+
+    df["Candle_Range"] = (
+        candle_range
+    )
+
+    df["Body"] = (
+        body.abs()
+    )
+
+    df["Body_Pct"] = (
+        body
+        / df["Open"]
+    ) * 100
+
+    df["Candle_Strength"] = (
+        df["Body"]
+        / candle_range
+    )
+
+    df["Upper_Wick"] = (
+        df["High"]
+        -
+        df[
+            ["Open", "Close"]
+        ].max(axis=1)
+    )
+
+    df["Lower_Wick"] = (
+        df[
+            ["Open", "Close"]
+        ].min(axis=1)
+        -
+        df["Low"]
+    )
+
+    df["Upper_Wick_Pct"] = (
+        df["Upper_Wick"]
+        /
+        candle_range
+    )
+
+    df["Lower_Wick_Pct"] = (
+        df["Lower_Wick"]
+        /
+        candle_range
+    )
+
+    return df
+
+
+# ====================================================================
+# ADD ALL HISTORICAL FEATURES
+# ====================================================================
+
+def add_features(
+    df: pd.DataFrame
+) -> pd.DataFrame:
+
+    df = add_historical_indicators(
+        df
+    )
+
+    df = add_candle_features(
+        df
+    )
+
+    df["Session_Date"] = (
+        df.index.date
+    )
+
+    df["Bar_Time"] = (
+        df.index.strftime(
+            "%H:%M"
+        )
+    )
+
+    return df
+
+
+# ====================================================================
+# RELATIVE VOLUME
+# ====================================================================
+
+def calculate_rvol_for_target(
+    df: pd.DataFrame,
+    target_date: pd.Timestamp,
+    bar_time: str,
+    current_volume: float,
+) -> Tuple[float, int]:
+    """Robust same-time-of-day RVOL with neutral fallback and coverage count."""
+    if df.empty or current_volume < 0:
+        return RVOL_NEUTRAL_FALLBACK, 0
+
+    target_day = target_date.date()
+
+    historical = df[
+        (df["Session_Date"] < target_day)
+        & (df["Bar_Time"] == bar_time)
+    ].copy()
+
+    if historical.empty:
+        return RVOL_NEUTRAL_FALLBACK, 0
+
+    historical = historical.sort_index().tail(RVOL_LOOKBACK_DAYS)
+    volumes = pd.to_numeric(historical["Volume"], errors="coerce").dropna().clip(lower=0)
+    positive = volumes[volumes > 0]
+    coverage = int(len(positive))
+
+    if coverage >= MIN_RVOL_POSITIVE_OBSERVATIONS:
+        baseline = float(positive.median())
+        if baseline > 0:
+            return float(current_volume / baseline), coverage
+
+    # Dormant/sparse names should not be deleted from the candidate set just
+    # because their historical time-of-day volume is sparse. Neutral RVOL
+    # means the volume family contributes no directional score.
+    return RVOL_NEUTRAL_FALLBACK, coverage
+
+
+# ====================================================================
+# NIFTY DATA
+# ====================================================================
+
+def download_nifty_data(
+    target_date: pd.Timestamp,
+    live_mode: bool = False,
+) -> pd.DataFrame:
+
+    from_date = target_date - pd.Timedelta(days=WARMUP_DAYS)
+
+    # NIFTY 50 is an index key, not an NSE_EQ security. The same V3
+    # candle endpoints are valid for the index key.
+    if live_mode:
+        # Warm-up through the previous calendar day.
+        historical_df = download_upstox_historical(
+            NIFTY50_TICKER,
+            target_date - pd.Timedelta(days=1),
+            from_date=from_date,
+            interval_minutes=UPSTOX_INTERVAL_MINUTES,
+        )
+
+        # Current session MUST come from the intraday endpoint.
+        current_day_df = download_upstox_intraday(
+            NIFTY50_TICKER,
+            interval_minutes=UPSTOX_INTERVAL_MINUTES,
+        )
+
+        return merge_market_data(
+            historical_df,
+            current_day_df,
+        )
+
+    return download_upstox_historical(
+        NIFTY50_TICKER,
+        target_date,
+        from_date=from_date,
+        interval_minutes=UPSTOX_INTERVAL_MINUTES,
+    )
+
+
+# ====================================================================
+# BENCHMARK RETURN
+# ====================================================================
+
+def calculate_market_returns(
+    nifty: pd.DataFrame,
+    target_date: pd.Timestamp
+) -> Tuple[float, float]:
+
+    session = filter_session(
+        nifty,
+        target_date
+    )
+
+    if len(session) < 2:
+
+        return (
+            np.nan,
+            np.nan
+        )
+
+    return calculate_market_returns_for_pair(
+        nifty,
+        target_date,
+        session.index[0],
+        session.index[1]
+    )
+
+
+def calculate_market_returns_for_pair(
+    nifty: pd.DataFrame,
+    target_date: pd.Timestamp,
+    first_timestamp: pd.Timestamp,
+    second_timestamp: pd.Timestamp
+) -> Tuple[float, float]:
+
+    session = filter_session(
+        nifty,
+        target_date
+    )
+
+    if session.empty:
+
+        return (
+            np.nan,
+            np.nan
+        )
+
+    try:
+
+        opening = session.loc[
+            first_timestamp
+        ]
+
+        confirmation = session.loc[
+            second_timestamp
+        ]
+
+    except KeyError:
+
+        return (
+            np.nan,
+            np.nan
+        )
+
+    opening_return = (
+        (
+            float(
+                opening["Close"]
+            )
+            -
+            float(
+                opening["Open"]
+            )
+        )
+        /
+        float(
+            opening["Open"]
+        )
+    ) * 100
+
+    total_return = (
+        (
+            float(
+                confirmation["Close"]
+            )
+            -
+            float(
+                opening["Open"]
+            )
+        )
+        /
+        float(
+            opening["Open"]
+        )
+    ) * 100
+
+    return (
+        opening_return,
+        total_return
+    )
+
+
+def get_last_completed_session_pair(
+    df: pd.DataFrame,
+    target_date: pd.Timestamp,
+    as_of: pd.Timestamp
+) -> Optional[Tuple[pd.Series, pd.Series]]:
+
+    session = filter_session(
+        df,
+        target_date
+    )
+
+    if session.empty:
+
+        return None
+
+    # A 15-minute bar is considered usable only after its
+    # timestamp + 15 minutes is at or before the observation time.
+    completed = session[
+        (
+            session.index
+            +
+            pd.Timedelta(minutes=15)
+        ) <= as_of
+    ]
+
+    if len(completed) < 2:
+
+        return None
+
+    return (
+        completed.iloc[-2],
+        completed.iloc[-1]
+    )
+
+
+# ====================================================================
+# CLAMP
+# ====================================================================
+
+def clamp(
+    value: float,
+    low: float,
+    high: float
+) -> float:
+
+    if not np.isfinite(value):
+
+        return 0.0
+
+    return float(
+        np.clip(
+            value,
+            low,
+            high
+        )
+    )
+
+
+# ====================================================================
+# CONTINUOUS SCORE HELPERS
+# ====================================================================
+
+def bearish_move_score(
+    value_pct: float,
+    scale: float
+) -> float:
+
+    if not np.isfinite(
+        value_pct
+    ):
+
+        return 0.0
+
+    return clamp(
+        (-value_pct / scale),
+        0,
+        1
+    )
+
+
+def bullish_move_score(
+    value_pct: float,
+    scale: float
+) -> float:
+
+    if not np.isfinite(
+        value_pct
+    ):
+
+        return 0.0
+
+    return clamp(
+        value_pct / scale,
+        0,
+        1
+    )
+
+
+# ====================================================================
+# EXHAUSTION MODEL
+# ====================================================================
+
+def calculate_short_exhaustion(
+    opening_pct: float,
+    vwap_pct: float,
+    ema20_pct: float,
+    rsi: float,
+    lower_wick_pct: float,
+    momentum_deceleration: bool
+) -> Tuple[
+    float,
+    List[str]
+]:
+
+    penalty = 0.0
+
+    flags: List[str] = []
+
+    # ------------------------------------------------------------
+    # Opening collapse
+    # ------------------------------------------------------------
+
+    if opening_pct <= -MAX_OPENING_COLLAPSE:
+
+        penalty += 12
+
+        flags.append(
+            "opening_collapse"
+        )
+
+    elif opening_pct <= -2.25:
+
+        penalty += 6
+
+        flags.append(
+            "large_opening_move"
+        )
+
+    # ------------------------------------------------------------
+    # VWAP extension
+    # ------------------------------------------------------------
+
+    if vwap_pct <= -MAX_SHORT_VWAP_DISTANCE:
+
+        penalty += 12
+
+        flags.append(
+            "far_below_vwap"
+        )
+
+    elif vwap_pct <= -2.0:
+
+        penalty += 6
+
+        flags.append(
+            "extended_vwap"
+        )
+
+    # ------------------------------------------------------------
+    # EMA extension
+    # ------------------------------------------------------------
+
+    if ema20_pct <= -MAX_SHORT_EMA20_DISTANCE:
+
+        penalty += 10
+
+        flags.append(
+            "far_below_ema20"
+        )
+
+    elif ema20_pct <= -2.5:
+
+        penalty += 5
+
+        flags.append(
+            "extended_ema20"
+        )
+
+    # ------------------------------------------------------------
+    # RSI
+    # ------------------------------------------------------------
+
+    if np.isfinite(rsi):
+
+        if rsi <= RSI_EXTREME_OVERSOLD:
+
+            penalty += 15
+
+            flags.append(
+                "extreme_oversold"
+            )
+
+        elif rsi <= RSI_OVERSOLD:
+
+            penalty += 8
+
+            flags.append(
+                "oversold"
+            )
+
+    # ------------------------------------------------------------
+    # Lower wick
+    # ------------------------------------------------------------
+
+    if np.isfinite(
+        lower_wick_pct
+    ):
+
+        if lower_wick_pct >= 0.45:
+
+            penalty += 8
+
+            flags.append(
+                "large_lower_wick"
+            )
+
+        elif lower_wick_pct >= 0.30:
+
+            penalty += 4
+
+            flags.append(
+                "lower_wick"
+            )
+
+    # ------------------------------------------------------------
+    # Deceleration
+    # ------------------------------------------------------------
+
+    if momentum_deceleration:
+
+        penalty += 8
+
+        flags.append(
+            "momentum_deceleration"
+        )
+
+    return (
+        penalty,
+        flags
+    )
+
+
+# ====================================================================
+# MARKET BETA / INTRADAY ALPHA
+# ====================================================================
+
+def calculate_intraday_beta(
+    stock_df: pd.DataFrame,
+    nifty_df: pd.DataFrame,
+    target_date: pd.Timestamp,
+    first_timestamp: pd.Timestamp,
+    second_timestamp: pd.Timestamp,
+) -> Tuple[float, int]:
+    """Estimate same-window beta using only sessions before target_date."""
+    stock = filter_session(stock_df, target_date)
+    _ = stock  # keep explicit that target-day rows are not used below
+
+    first_time = first_timestamp.time()
+    second_time = second_timestamp.time()
+    target_day = target_date.date()
+
+    stock_hist = stock_df[stock_df.index.date < target_day]
+    nifty_hist = nifty_df[nifty_df.index.date < target_day]
+
+    if stock_hist.empty or nifty_hist.empty:
+        return np.nan, 0
+
+    stock_hist = stock_hist.sort_index()
+    nifty_hist = nifty_hist.sort_index()
+
+    common_days = sorted(
+        set(stock_hist.index.date).intersection(nifty_hist.index.date),
+        reverse=True,
+    )[:BETA_LOOKBACK_DAYS]
+
+    stock_returns = []
+    nifty_returns = []
+
+    for session_date in common_days:
+        day_s = stock_hist[stock_hist.index.date == session_date]
+        day_n = nifty_hist[nifty_hist.index.date == session_date]
+
+        s1 = day_s[day_s.index.time == first_time]
+        s2 = day_s[day_s.index.time == second_time]
+        n1 = day_n[day_n.index.time == first_time]
+        n2 = day_n[day_n.index.time == second_time]
+
+        if s1.empty or s2.empty or n1.empty or n2.empty:
+            continue
+
+        s_open = float(s1.iloc[0]["Open"])
+        s_close = float(s2.iloc[0]["Close"])
+        n_open = float(n1.iloc[0]["Open"])
+        n_close = float(n2.iloc[0]["Close"])
+
+        if min(s_open, n_open) <= 0:
+            continue
+
+        stock_returns.append((s_close / s_open - 1.0) * 100.0)
+        nifty_returns.append((n_close / n_open - 1.0) * 100.0)
+
+    observations = len(stock_returns)
+    if observations < BETA_MIN_OBSERVATIONS:
+        return np.nan, observations
+
+    x = np.asarray(nifty_returns, dtype=float)
+    y = np.asarray(stock_returns, dtype=float)
+
+    variance = float(np.var(x, ddof=1))
+    if not np.isfinite(variance) or variance <= 1e-10:
+        return np.nan, observations
+
+    beta = float(np.cov(y, x, ddof=1)[0, 1] / variance)
+    if not np.isfinite(beta):
+        return np.nan, observations
+
+    beta = float(np.clip(beta, BETA_MIN, BETA_MAX))
+    beta = (1.0 - BETA_SHRINK_TO_ONE) * beta + BETA_SHRINK_TO_ONE * 1.0
+    return beta, observations
+
+
+# ====================================================================
+# ANALYSE 09:45
+# ====================================================================
+
+def analyse_at_0945(
+    ticker: str,
+    full_df: pd.DataFrame,
+    target_date: pd.Timestamp,
+    nifty_opening_return: float,
+    nifty_total_return: float,
+    rolling_live: bool = False,
+    nifty_df: Optional[pd.DataFrame] = None,
+) -> Optional[dict]:
+
+    if full_df.empty:
+
+        return None
+
+    # ------------------------------------------------------------
+    # Historical indicators already include warm-up data.
+    # ------------------------------------------------------------
+
+    df = add_features(
+        full_df
+    )
+
+    session = filter_session(
+        df,
+        target_date
+    )
+
+    if len(session) < 2:
+
+        return None
+
+    if rolling_live:
+
+        if len(session) < 2:
+            return None
+
+        opening = session.iloc[-2]
+        confirmation = session.iloc[-1]
+
+        if confirmation.name != opening.name + pd.Timedelta(minutes=ENTRY_BAR_MINUTES):
+            return None
+
+    else:
+
+        if REQUIRE_COMPLETE_SIGNAL_BARS and not validate_fixed_signal_window(session, target_date):
+            return None
+
+        first_ts, second_ts = expected_0945_timestamps(target_date)
+        opening = session.loc[first_ts]
+        confirmation = session.loc[second_ts]
+
+    # ============================================================
+    # PRICE MOVEMENTS
+    # ============================================================
+
+    opening_price = float(
+        opening["Open"]
+    )
+
+    opening_close = float(
+        opening["Close"]
+    )
+
+    confirmation_open = float(
+        confirmation["Open"]
+    )
+
+    decision_price = float(
+        confirmation["Close"]
+    )
+
+    opening_pct = (
+        (
+            opening_close
+            -
+            opening_price
+        )
+        /
+        opening_price
+    ) * 100
+
+    confirmation_pct = (
+        (
+            decision_price
+            -
+            confirmation_open
+        )
+        /
+        confirmation_open
+    ) * 100
+
+    total_pct = (
+        (
+            decision_price
+            -
+            opening_price
+        )
+        /
+        opening_price
+    ) * 100
+
+    # ============================================================
+    # MARKET RELATIVE STRENGTH
+    # ============================================================
+
+    relative_opening_strength = (
+        opening_pct - nifty_opening_return
+        if np.isfinite(nifty_opening_return) else np.nan
+    )
+
+    relative_total_strength = (
+        total_pct - nifty_total_return
+        if np.isfinite(nifty_total_return) else np.nan
+    )
+
+    market_beta = np.nan
+    beta_observations = 0
+    beta_adjusted_alpha = relative_total_strength
+
+    if nifty_df is not None:
+        market_beta, beta_observations = calculate_intraday_beta(
+            full_df,
+            nifty_df,
+            target_date,
+            opening.name,
+            confirmation.name,
+        )
+
+        if np.isfinite(market_beta) and np.isfinite(nifty_total_return):
+            beta_adjusted_alpha = total_pct - (market_beta * nifty_total_return)
+
+    # ============================================================
+    # INDICATORS
+    # ============================================================
+
+    vwap = calculate_session_vwap(
+        session
+    )
+
+    vwap_index = (
+        -1
+        if rolling_live
+        else 1
+    )
+
+    vwap_value = float(
+        vwap.iloc[vwap_index]
+    )
+
+    ema9 = float(
+        confirmation["EMA9"]
+    )
+
+    ema20 = float(
+        confirmation["EMA20"]
+    )
+
+    rsi = float(
+        confirmation["RSI"]
+    ) if pd.notna(
+        confirmation["RSI"]
+    ) else np.nan
+
+    macd = float(
+        confirmation["MACD"]
+    ) if pd.notna(
+        confirmation["MACD"]
+    ) else np.nan
+
+    macd_signal = float(
+        confirmation["MACD_Signal"]
+    ) if pd.notna(
+        confirmation["MACD_Signal"]
+    ) else np.nan
+
+    macd_hist = float(
+        confirmation["MACD_Hist"]
+    ) if pd.notna(
+        confirmation["MACD_Hist"]
+    ) else np.nan
+
+    atr = float(
+        confirmation["ATR"]
+    ) if pd.notna(
+        confirmation["ATR"]
+    ) else np.nan
+
+    atr_pct = float(
+        confirmation["ATR_Pct"]
+    ) if pd.notna(
+        confirmation["ATR_Pct"]
+    ) else np.nan
+
+    # ============================================================
+    # PRICE DISTANCES
+    # ============================================================
+
+    vwap_pct = (
+        (
+            decision_price
+            -
+            vwap_value
+        )
+        /
+        vwap_value
+    ) * 100
+
+    ema20_pct = (
+        (
+            decision_price
+            -
+            ema20
+        )
+        /
+        ema20
+    ) * 100
+
+    ema9_pct = (
+        (
+            decision_price
+            -
+            ema9
+        )
+        /
+        ema9
+    ) * 100
+
+    ema_spread_pct = (
+        (
+            ema9
+            -
+            ema20
+        )
+        /
+        ema20
+    ) * 100
+
+    # ============================================================
+    # ATR NORMALIZATION
+    # ============================================================
+
+    if (
+        np.isfinite(atr)
+        and atr > 0
+    ):
+
+        normalized_total_move = (
+            (
+                decision_price
+                -
+                opening_price
+            )
+            /
+            atr
+        )
+
+    else:
+
+        normalized_total_move = np.nan
+
+    # ============================================================
+    # STRUCTURE
+    # ============================================================
+
+    opening_high = float(
+        opening["High"]
+    )
+
+    opening_low = float(
+        opening["Low"]
+    )
+
+    confirmation_high = float(
+        confirmation["High"]
+    )
+
+    confirmation_low = float(
+        confirmation["Low"]
+    )
+
+    lower_low = (
+        confirmation_low
+        <
+        opening_low
+    )
+
+    higher_high = (
+        confirmation_high
+        >
+        opening_high
+    )
+
+    # ============================================================
+    # CANDLE
+    # ============================================================
+
+    confirmation_range = float(
+        confirmation["Candle_Range"]
+    )
+
+    candle_strength = float(
+        confirmation["Candle_Strength"]
+    ) if pd.notna(
+        confirmation["Candle_Strength"]
+    ) else np.nan
+
+    lower_wick_pct = float(
+        confirmation["Lower_Wick_Pct"]
+    ) if pd.notna(
+        confirmation["Lower_Wick_Pct"]
+    ) else np.nan
+
+    upper_wick_pct = float(
+        confirmation["Upper_Wick_Pct"]
+    ) if pd.notna(
+        confirmation["Upper_Wick_Pct"]
+    ) else np.nan
+
+    bearish_confirmation = (
+        decision_price
+        <
+        confirmation_open
+    )
+
+    bullish_confirmation = (
+        decision_price
+        >
+        confirmation_open
+    )
+
+    # ============================================================
+    # RANGE EXPANSION
+    # ============================================================
+
+    opening_range = (
+        opening_high
+        -
+        opening_low
+    )
+
+    range_expansion = (
+        confirmation_range
+        /
+        opening_range
+        if opening_range > 0
+        else np.nan
+    )
+
+    # ============================================================
+    # RELATIVE VOLUME
+    # ============================================================
+
+    opening_bar_time = (
+        opening.name.strftime("%H:%M")
+    )
+
+    confirmation_bar_time = (
+        confirmation.name.strftime("%H:%M")
+    )
+
+    opening_rvol, opening_rvol_observations = calculate_rvol_for_target(
+        df, target_date, opening_bar_time, float(opening["Volume"])
+    )
+
+    confirmation_rvol, confirmation_rvol_observations = calculate_rvol_for_target(
+        df, target_date, confirmation_bar_time, float(confirmation["Volume"])
+    )
+
+    # ============================================================
+    # MOMENTUM DECELERATION
+    # ============================================================
+
+    momentum_deceleration = (
+
+        opening_pct < -0.75
+
+        and confirmation_pct
+        > opening_pct * 0.55
+
+        and confirmation_pct > -0.25
+    )
+
+    momentum_acceleration = (
+
+        opening_pct < 0
+
+        and confirmation_pct
+        < opening_pct * 0.75
+    )
+
+    # ============================================================
+    # CONTINUATION
+    # ============================================================
+
+    short_continuation = (
+
+        opening_pct < -0.25
+
+        and confirmation_pct < -0.10
+
+        and lower_low
+    )
+
+    long_continuation = (
+
+        opening_pct > 0.25
+
+        and confirmation_pct > 0.10
+
+        and higher_high
+    )
+
+    # ============================================================
+    # REVERSAL
+    # ============================================================
+
+    short_reversal = (
+
+        opening_pct < -0.75
+
+        and confirmation_pct > 0.30
+
+        and not lower_low
+    )
+
+    long_reversal = (
+
+        opening_pct > 0.75
+
+        and confirmation_pct < -0.30
+
+        and not higher_high
+    )
+
+    # ============================================================
+    # EXHAUSTION
+    # ============================================================
+
+    exhaustion_penalty, exhaustion_flags = (
+        calculate_short_exhaustion(
+
+            opening_pct=opening_pct,
+
+            vwap_pct=vwap_pct,
+
+            ema20_pct=ema20_pct,
+
+            rsi=rsi,
+
+            lower_wick_pct=lower_wick_pct,
+
+            momentum_deceleration=(
+                momentum_deceleration
+            ),
+        )
+    )
+
+    # ============================================================
+    # SHORT SCORE
+    # ============================================================
+
+    short_score = 0.0
+
+    # ------------------------------------------------------------
+    # 1. Opening momentum
+    # ------------------------------------------------------------
+
+    short_score += (
+        12
+        *
+        bearish_move_score(
+            opening_pct,
+            1.50
+        )
+    )
+
+    # ------------------------------------------------------------
+    # 2. Confirmation momentum
+    # ------------------------------------------------------------
+
+    short_score += (
+        12
+        *
+        bearish_move_score(
+            confirmation_pct,
+            1.00
+        )
+    )
+
+    # ------------------------------------------------------------
+    # 3. Market-relative weakness
+    # ------------------------------------------------------------
+
+    short_score += (
+        12
+        *
+        bearish_move_score(
+            beta_adjusted_alpha,
+            1.50
+        )
+    )
+
+    # ------------------------------------------------------------
+    # 4. VWAP location
+    # ------------------------------------------------------------
+
+    short_score += (
+        10
+        *
+        clamp(
+            -vwap_pct / 2.0,
+            0,
+            1
+        )
+    )
+
+    # ------------------------------------------------------------
+    # 5. EMA structure
+    # ------------------------------------------------------------
+
+    ema_structure = 0.0
+
+    if (
+        decision_price
+        < ema20
+    ):
+
+        ema_structure += 0.50
+
+    if (
+        ema9
+        < ema20
+    ):
+
+        ema_structure += 0.50
+
+    short_score += (
+        10
+        * ema_structure
+    )
+
+    # ------------------------------------------------------------
+    # 6. MACD structure
+    # ------------------------------------------------------------
+
+    macd_structure = 0.0
+
+    if (
+        np.isfinite(macd)
+        and np.isfinite(macd_signal)
+        and macd < macd_signal
+    ):
+
+        macd_structure += 0.60
+
+    if (
+        np.isfinite(macd_hist)
+        and macd_hist < 0
+    ):
+
+        macd_structure += 0.40
+
+    short_score += (
+        8
+        *
+        min(
+            1.0,
+            macd_structure
+        )
+    )
+
+    # ------------------------------------------------------------
+    # 7. Volume
+    # ------------------------------------------------------------
+
+    volume_strength = 0.0
+
+    if np.isfinite(
+        opening_rvol
+    ):
+
+        volume_strength += (
+            clamp(
+                (
+                    opening_rvol
+                    - 1.0
+                )
+                /
+                1.5,
+                0,
+                1
+            )
+            * 0.40
+        )
+
+    if np.isfinite(
+        confirmation_rvol
+    ):
+
+        volume_strength += (
+            clamp(
+                (
+                    confirmation_rvol
+                    - 1.0
+                )
+                /
+                1.5,
+                0,
+                1
+            )
+            * 0.60
+        )
+
+    short_score += (
+        8
+        *
+        min(
+            1.0,
+            volume_strength
+        )
+    )
+
+    # ------------------------------------------------------------
+    # 8. Structure
+    # ------------------------------------------------------------
+
+    structure_score = 0.0
+
+    if lower_low:
+
+        structure_score += 0.60
+
+    if bearish_confirmation:
+
+        structure_score += 0.20
+
+    if (
+        np.isfinite(
+            lower_wick_pct
+        )
+        and lower_wick_pct < 0.20
+    ):
+
+        structure_score += 0.20
+
+    short_score += (
+        10
+        *
+        min(
+            1.0,
+            structure_score
+        )
+    )
+
+    # ------------------------------------------------------------
+    # 9. Range expansion
+    # ------------------------------------------------------------
+
+    if np.isfinite(
+        range_expansion
+    ):
+
+        short_score += (
+            5
+            *
+            clamp(
+                (
+                    range_expansion
+                    - 0.75
+                )
+                /
+                0.75,
+                0,
+                1
+            )
+        )
+
+    # ------------------------------------------------------------
+    # 10. ATR-normalized momentum
+    # ------------------------------------------------------------
+
+    if np.isfinite(
+        normalized_total_move
+    ):
+
+        short_score += (
+            5
+            *
+            clamp(
+                -normalized_total_move
+                / 2.0,
+                0,
+                1
+            )
+        )
+
+    # ------------------------------------------------------------
+    # Continuation bonus
+    # ------------------------------------------------------------
+
+    if short_continuation:
+
+        short_score += 6
+
+    # ------------------------------------------------------------
+    # Acceleration bonus
+    # ------------------------------------------------------------
+
+    if momentum_acceleration:
+
+        short_score += 4
+
+    # ------------------------------------------------------------
+    # Reversal penalty
+    # ------------------------------------------------------------
+
+    if short_reversal:
+
+        short_score -= 25
+
+    # ------------------------------------------------------------
+    # Exhaustion penalty
+    # ------------------------------------------------------------
+
+    short_score -= exhaustion_penalty
+
+    # ============================================================
+    # RSI BALANCE
+    # ============================================================
+
+    if np.isfinite(rsi):
+
+        # Prefer bearish momentum that is not completely exhausted.
+
+        if 32 <= rsi <= 55:
+
+            short_score += 5
+
+        elif 28 <= rsi < 32:
+
+            short_score += 2
+
+        elif rsi < 22:
+
+            short_score -= 5
+
+    # ============================================================
+    # LONG SCORE
+    # ============================================================
+
+    long_score = 0.0
+
+    # Opening momentum
+    long_score += (
+        12
+        *
+        bullish_move_score(
+            opening_pct,
+            1.50
+        )
+    )
+
+    # Confirmation momentum
+    long_score += (
+        12
+        *
+        bullish_move_score(
+            confirmation_pct,
+            1.00
+        )
+    )
+
+    # Relative strength
+    long_score += (
+        12
+        *
+        bullish_move_score(
+            beta_adjusted_alpha,
+            1.50
+        )
+    )
+
+    # VWAP
+    long_score += (
+        10
+        *
+        clamp(
+            vwap_pct / 2.0,
+            0,
+            1
+        )
+    )
+
+    # EMA structure
+    long_ema_structure = 0.0
+
+    if (
+        decision_price
+        > ema20
+    ):
+
+        long_ema_structure += 0.50
+
+    if (
+        ema9
+        > ema20
+    ):
+
+        long_ema_structure += 0.50
+
+    long_score += (
+        10
+        * long_ema_structure
+    )
+
+    # MACD
+    long_macd_structure = 0.0
+
+    if (
+        np.isfinite(macd)
+        and np.isfinite(macd_signal)
+        and macd > macd_signal
+    ):
+
+        long_macd_structure += 0.60
+
+    if (
+        np.isfinite(macd_hist)
+        and macd_hist > 0
+    ):
+
+        long_macd_structure += 0.40
+
+    long_score += (
+        8
+        *
+        min(
+            1.0,
+            long_macd_structure
+        )
+    )
+
+    # Volume
+    long_volume_strength = 0.0
+
+    if np.isfinite(
+        opening_rvol
+    ):
+
+        long_volume_strength += (
+            clamp(
+                (
+                    opening_rvol
+                    - 1.0
+                )
+                /
+                1.5,
+                0,
+                1
+            )
+            * 0.40
+        )
+
+    if np.isfinite(
+        confirmation_rvol
+    ):
+
+        long_volume_strength += (
+            clamp(
+                (
+                    confirmation_rvol
+                    - 1.0
+                )
+                /
+                1.5,
+                0,
+                1
+            )
+            * 0.60
+        )
+
+    long_score += (
+        8
+        *
+        min(
+            1.0,
+            long_volume_strength
+        )
+    )
+
+    # Structure
+    long_structure = 0.0
+
+    if higher_high:
+
+        long_structure += 0.60
+
+    if bullish_confirmation:
+
+        long_structure += 0.20
+
+    if (
+        np.isfinite(
+            upper_wick_pct
+        )
+        and upper_wick_pct < 0.20
+    ):
+
+        long_structure += 0.20
+
+    long_score += (
+        10
+        *
+        min(
+            1.0,
+            long_structure
+        )
+    )
+
+    # Range expansion
+    if np.isfinite(
+        range_expansion
+    ):
+
+        long_score += (
+            5
+            *
+            clamp(
+                (
+                    range_expansion
+                    - 0.75
+                )
+                /
+                0.75,
+                0,
+                1
+            )
+        )
+
+    # ATR normalized momentum
+    if np.isfinite(
+        normalized_total_move
+    ):
+
+        long_score += (
+            5
+            *
+            clamp(
+                normalized_total_move
+                / 2.0,
+                0,
+                1
+            )
+        )
+
+    if long_continuation:
+
+        long_score += 6
+
+    if long_reversal:
+
+        long_score -= 25
+
+    # RSI
+    if np.isfinite(rsi):
+
+        if 45 <= rsi <= 70:
+
+            long_score += 5
+
+        elif rsi > 78:
+
+            long_score -= 6
+
+    # ============================================================
+    # FINAL SCORE
+    # ============================================================
+
+    short_score = clamp(
+        short_score,
+        0,
+        100
+    )
+
+    long_score = clamp(
+        long_score,
+        0,
+        100
+    )
+
+    # ============================================================
+    # TURNOVER
+    # ============================================================
+
+    turnover_cr = (
+        float(
+            confirmation["Volume"]
+        )
+        *
+        decision_price
+        /
+        10_000_000
+    )
+
+    (
+        median_daily_turnover_cr,
+        median_daily_volume_lakh,
+    ) = calculate_median_daily_liquidity(
+        full_df,
+        target_date,
+    )
+
+    # ============================================================
+    # DECISION
+    # ============================================================
+
+    signal = "AVOID"
+
+    conviction = "NEUTRAL"
+
+    score = max(
+        short_score,
+        long_score
+    )
+
+    if (
+        short_score
+        >= SHORT_TRADEABLE_SCORE
+
+        and short_score
+        >= long_score
+
+        and total_pct
+        <= -MIN_SHORT_TOTAL_MOVE
+
+        and opening_pct
+        <= -MIN_OPENING_SHORT_MOVE
+
+        and not short_reversal
+    ):
+
+        signal = "SHORT"
+
+        score = short_score
+
+        if (
+            short_score
+            >= SHORT_HIGH_CONVICTION_SCORE
+        ):
+
+            conviction = "HIGH"
+
+        else:
+
+            conviction = "TRADEABLE"
+
+    elif (
+        long_score
+        >= LONG_TRADEABLE_SCORE
+
+        and long_score
+        > short_score
+
+        and total_pct
+        >= MIN_LONG_TOTAL_MOVE
+
+        and opening_pct
+        >= MIN_OPENING_LONG_MOVE
+
+        and not long_reversal
+    ):
+
+        signal = "LONG"
+
+        score = long_score
+
+        if (
+            long_score
+            >= LONG_HIGH_CONVICTION_SCORE
+        ):
+
+            conviction = "HIGH"
+
+        else:
+
+            conviction = "TRADEABLE"
+
+    # ============================================================
+    # DATA QUALITY
+    # ============================================================
+
+    indicator_ready = all(
+        np.isfinite(x)
+        for x in [
+            ema9,
+            ema20,
+            rsi,
+            atr,
+        ]
+    )
+
+    if not indicator_ready:
+
+        return None
+
+    return {
+
+        "Ticker":
+            ticker.replace(
+                ".NS",
+                ""
+            ),
+
+        "Signal":
+            signal,
+
+        "Conviction":
+            conviction,
+
+        "Score":
+            round(
+                score,
+                2
+            ),
+
+        "Short Score":
+            round(
+                short_score,
+                2
+            ),
+
+        "Long Score":
+            round(
+                long_score,
+                2
+            ),
+
+        "Opening %":
+            opening_pct,
+
+        "09:30-09:45 %":
+            confirmation_pct,
+
+        "Total %":
+            total_pct,
+
+        "NIFTY Opening %":
+            nifty_opening_return,
+
+        "NIFTY Total %":
+            nifty_total_return,
+
+        "Relative Opening %":
+            relative_opening_strength,
+
+        "Relative Total %":
+            relative_total_strength,
+
+        "Beta Adjusted Alpha %":
+            beta_adjusted_alpha,
+
+        "Market Beta":
+            market_beta,
+
+        "Beta Observations":
+            beta_observations,
+
+        "Price":
+            decision_price,
+
+        "VWAP %":
+            vwap_pct,
+
+        "EMA20 %":
+            ema20_pct,
+
+        "EMA9 %":
+            ema9_pct,
+
+        "EMA Spread %":
+            ema_spread_pct,
+
+        "ATR %":
+            atr_pct,
+
+        "ATR Move":
+            normalized_total_move,
+
+        "Opening RVOL":
+            opening_rvol,
+
+        "Opening RVOL Observations":
+            opening_rvol_observations,
+
+        "Confirmation RVOL":
+            confirmation_rvol,
+
+        "Confirmation RVOL Observations":
+            confirmation_rvol_observations,
+
+        "RSI":
+            rsi,
+
+        "MACD Hist":
+            macd_hist,
+
+        "MACD":
+            (
+                "Bullish"
+                if macd > macd_signal
+                else "Bearish"
+            ),
+
+        "Turnover Cr":
+            turnover_cr,
+
+        "Median Daily Turnover Cr":
+            median_daily_turnover_cr,
+
+        "Median Daily Volume Lakh":
+            median_daily_volume_lakh,
+
+        "Opening High":
+            opening_high,
+
+        "Opening Low":
+            opening_low,
+
+        "Lower Low":
+            lower_low,
+
+        "Higher High":
+            higher_high,
+
+        "Range Expansion":
+            range_expansion,
+
+        "Candle Strength":
+            candle_strength,
+
+        "Lower Wick":
+            lower_wick_pct,
+
+        "Upper Wick":
+            upper_wick_pct,
+
+        "Exhaustion Penalty":
+            exhaustion_penalty,
+
+        "Exhaustion Flags":
+            ",".join(
+                exhaustion_flags
+            )
+            if exhaustion_flags
+            else "",
+
+        "First 15m %":
+            opening_pct,
+
+        "Last 15m %":
+            confirmation_pct,
+
+        "Window %":
+            total_pct,
+
+        "Window Start":
+            opening.name,
+
+        "Signal Candle Timestamp":
+            confirmation.name,
+
+        "Window End":
+            confirmation.name
+            + pd.Timedelta(minutes=ENTRY_BAR_MINUTES),
+
+        "Decision Timestamp":
+            confirmation.name
+            + pd.Timedelta(minutes=ENTRY_BAR_MINUTES),
+
+        "Entry Timestamp":
+            confirmation.name
+            + pd.Timedelta(minutes=ENTRY_BAR_MINUTES),
+
+        "_Data":
+            df,
+    }
+
+
+# ====================================================================
+# 1-MINUTE DATA
+# ====================================================================
+
+def download_1m_data(
+    ticker: str,
+    target_date: pd.Timestamp
+) -> pd.DataFrame:
+
+    instrument_key = ticker_to_instrument_key(
+        ticker
+    )
+
+    if not instrument_key:
+        return pd.DataFrame()
+
+    from_date = (
+        target_date
+        - pd.Timedelta(days=UPSTOX_HISTORICAL_DAYS)
+    )
+
+    return download_upstox_historical(
+        instrument_key,
+        target_date,
+        from_date=from_date,
+        interval_minutes=1,
+    )
+
+
+# ====================================================================
+# OUTCOME USING FINE DATA
+# ====================================================================
+
+def evaluate_from_bars(
+    signal: str,
+    decision_price: float,
+    future: pd.DataFrame
+) -> dict:
+
+    if future.empty:
+        return {
+            "MFE": np.nan,
+            "MAE": np.nan,
+            "Outcome": "NO_DATA",
+            "Target": np.nan,
+            "Stop": np.nan,
+            "Gross Return": np.nan,
+            "Net Return": np.nan,
+            "Bars Held": np.nan,
+            "Exit Timestamp": pd.NaT,
+        }
+
+    future = future.sort_index().copy()
+
+    if signal == "LONG":
+        target = decision_price * (1 + TARGET_PCT / 100)
+        stop = decision_price * (1 - STOP_PCT / 100)
+    else:
+        target = decision_price * (1 - TARGET_PCT / 100)
+        stop = decision_price * (1 + STOP_PCT / 100)
+
+    outcome = "OPEN"
+    exit_price = np.nan
+    exit_timestamp = pd.NaT
+    bars_held = 0
+    running_high = decision_price
+    running_low = decision_price
+
+    for timestamp, row in future.iterrows():
+        bars_held += 1
+        running_high = max(running_high, float(row["High"]))
+        running_low = min(running_low, float(row["Low"]))
+
+        if signal == "LONG":
+            hit_stop = float(row["Low"]) <= stop
+            hit_target = float(row["High"]) >= target
+        else:
+            hit_stop = float(row["High"]) >= stop
+            hit_target = float(row["Low"]) <= target
+
+        # Conservative treatment when both levels are touched in one bar.
+        if hit_stop and hit_target:
+            outcome = "STOP"
+            exit_price = stop
+            exit_timestamp = timestamp
+            break
+        if hit_stop:
+            outcome = "STOP"
+            exit_price = stop
+            exit_timestamp = timestamp
+            break
+        if hit_target:
+            outcome = "TARGET"
+            exit_price = target
+            exit_timestamp = timestamp
+            break
+
+    if outcome == "OPEN":
+        exit_price = float(future.iloc[-1]["Close"])
+        exit_timestamp = future.index[-1]
+        if signal == "LONG":
+            outcome = "PROFIT" if exit_price > decision_price else "LOSS"
+        else:
+            outcome = "PROFIT" if exit_price < decision_price else "LOSS"
+
+    if signal == "LONG":
+        mfe = ((running_high - decision_price) / decision_price) * 100
+        mae = ((running_low - decision_price) / decision_price) * 100
+        gross_return = ((exit_price - decision_price) / decision_price) * 100
+    else:
+        mfe = ((decision_price - running_low) / decision_price) * 100
+        mae = ((running_high - decision_price) / decision_price) * 100
+        gross_return = ((decision_price - exit_price) / decision_price) * 100
+
+    net_return = gross_return - COST_MODEL.total_cost_pct
+
+    return {
+        "MFE": float(mfe),
+        "MAE": float(mae),
+        "Outcome": outcome,
+        "Target": target,
+        "Stop": stop,
+        "Gross Return": float(gross_return),
+        "Net Return": float(net_return),
+        "Bars Held": bars_held,
+        "Exit Timestamp": exit_timestamp,
+    }
+
+
+# ====================================================================
+# HISTORICAL OUTCOME
+# ====================================================================
+
+def calculate_historical_outcome(
+    analysis: dict,
+    full_df: pd.DataFrame,
+    target_date: pd.Timestamp
+) -> dict:
+
+    signal = analysis[
+        "Signal"
+    ]
+
+    if signal not in (
+        "LONG",
+        "SHORT"
+    ):
+
+        return {
+
+            "MFE":
+                np.nan,
+
+            "MAE":
+                np.nan,
+
+            "Outcome":
+                "N/A",
+
+            "Target":
+                np.nan,
+
+            "Stop":
+                np.nan,
+
+            "Gross Return":
+                np.nan,
+
+            "Net Return":
+                np.nan,
+
+            "Bars Held":
+                np.nan,
+
+            "Exit Timestamp":
+                pd.NaT,
+        }
+
+    decision_timestamp = (
+        analysis.get(
+            "Entry Timestamp",
+            analysis["Decision Timestamp"],
+        )
+    )
+
+    decision_price = float(
+        analysis["Price"]
+    )
+
+    # ------------------------------------------------------------
+    # Prefer 1-minute data.
+    # ------------------------------------------------------------
+
+    if USE_1M_EVALUATION:
+
+        ticker = analysis["Ticker"]
+
+        one_minute = (
+            download_1m_data(
+                ticker,
+                target_date
+            )
+        )
+
+        if not one_minute.empty:
+
+            future = one_minute[
+                (one_minute.index >= decision_timestamp)
+                & (one_minute.index < decision_timestamp.normalize() + pd.Timedelta(hours=15, minutes=30))
+            ].copy()
+
+            if not future.empty:
+
+                return evaluate_from_bars(
+                    signal,
+                    decision_price,
+                    future
+                )
+
+    # ------------------------------------------------------------
+    # 15-minute fallback.
+    # ------------------------------------------------------------
+
+    if not ALLOW_15M_FALLBACK:
+
+        return {
+
+            "MFE":
+                np.nan,
+
+            "MAE":
+                np.nan,
+
+            "Outcome":
+                "NO_1M_DATA",
+
+            "Target":
+                np.nan,
+
+            "Stop":
+                np.nan,
+
+            "Gross Return":
+                np.nan,
+
+            "Net Return":
+                np.nan,
+
+            "Bars Held":
+                np.nan,
+
+            "Exit Timestamp":
+                pd.NaT,
+        }
+
+    future = full_df[
+        (full_df.index >= decision_timestamp)
+        & (full_df.index < decision_timestamp.normalize() + pd.Timedelta(hours=15, minutes=30))
+    ].copy()
+
+    if future.empty:
+
+        return {
+
+            "MFE":
+                np.nan,
+
+            "MAE":
+                np.nan,
+
+            "Outcome":
+                "NO_DATA",
+
+            "Target":
+                np.nan,
+
+            "Stop":
+                np.nan,
+
+            "Gross Return":
+                np.nan,
+
+            "Net Return":
+                np.nan,
+
+            "Bars Held":
+                np.nan,
+
+            "Exit Timestamp":
+                pd.NaT,
+        }
+
+    return evaluate_from_bars(
+        signal,
+        decision_price,
+        future
+    )
+
+
+# ====================================================================
+# DISPLAY COLUMNS
+# ====================================================================
+
+DISPLAY_COLUMNS = [
+
+    "Rank",
+
+    "Ticker",
+
+    "Signal",
+
+    "Conviction",
+
+    "Score",
+
+    "Opening %",
+
+    "09:30-09:45 %",
+
+    "Total %",
+
+    "Relative Total %",
+
+    "Beta Adjusted Alpha %",
+
+    "Market Beta",
+
+    "Price",
+
+    "VWAP %",
+
+    "EMA20 %",
+
+    "Opening RVOL",
+
+    "Confirmation RVOL",
+
+    "RSI",
+
+    "MACD",
+
+    "Turnover Cr",
+    "Median Daily Turnover Cr",
+    "Median Daily Volume Lakh",
+]
+
+
+# ====================================================================
+# DISPLAY FORMAT
+# ====================================================================
+
+def format_display(
+    df: pd.DataFrame
+) -> pd.DataFrame:
+
+    if df.empty:
+
+        return df
+
+    out = df.copy()
+
+    percentage_columns = [
+
+        "Opening %",
+
+        "09:30-09:45 %",
+
+        "Total %",
+
+        "Relative Total %",
+
+        "VWAP %",
+
+        "EMA20 %",
+    ]
+
+    for column in percentage_columns:
+
+        out[column] = out[
+            column
+        ].map(
+
+            lambda x:
+            (
+                f"{x:+.2f}%"
+                if pd.notna(x)
+                else "-"
+            )
+        )
+
+    out["Price"] = out[
+        "Price"
+    ].map(
+
+        lambda x:
+        (
+            f"₹{x:,.2f}"
+            if pd.notna(x)
+            else "-"
+        )
+    )
+
+    for column in [
+        "Opening RVOL",
+        "Confirmation RVOL",
+    ]:
+
+        out[column] = out[
+            column
+        ].map(
+
+            lambda x:
+            (
+                f"{x:.2f}x"
+                if pd.notna(x)
+                else "-"
+            )
+        )
+
+    out["RSI"] = out[
+        "RSI"
+    ].map(
+
+        lambda x:
+        (
+            f"{x:.1f}"
+            if pd.notna(x)
+            else "-"
+        )
+    )
+
+    for column in [
+        "Window Start",
+        "Window End",
+    ]:
+
+        if column in out.columns:
+
+            out[column] = out[column].map(
+
+                lambda x:
+                (
+                    pd.Timestamp(x).strftime("%H:%M")
+                    if pd.notna(x)
+                    else "-"
+                )
+            )
+
+    for column in ["Turnover Cr", "Median Daily Turnover Cr"]:
+
+        if column in out.columns:
+            out[column] = out[column].map(
+
+                lambda x:
+                (
+                    f"{x:.1f}"
+                    if pd.notna(x)
+                    else "-"
+                )
+            )
+
+    if "Median Daily Volume Lakh" in out.columns:
+        out["Median Daily Volume Lakh"] = out["Median Daily Volume Lakh"].map(
+            lambda x: f"{x:.1f}" if pd.notna(x) else "-"
+        )
+
+    if "Market Beta" in out.columns:
+        out["Market Beta"] = out["Market Beta"].map(
+            lambda x: f"{x:.2f}" if pd.notna(x) else "-"
+        )
+
+    out["Score"] = out[
+        "Score"
+    ].map(
+
+        lambda x:
+        (
+            f"{x:.0f}"
+            if pd.notna(x)
+            else "-"
+        )
+    )
+
+    return out
+
+
+# ====================================================================
+# PRINT TABLE
+# ====================================================================
+
+def print_table(
+    title: str,
+    df: pd.DataFrame,
+    columns: Optional[List[str]] = None
+) -> None:
+
+    print()
+
+    print(
+        "=" * 150
+    )
+
+    print(title)
+
+    print(
+        "=" * 150
+    )
+
+    if df.empty:
+
+        print(
+            "No stocks matched."
+        )
+
+        return
+
+    selected_columns = (
+        columns
+        if columns is not None
+        else DISPLAY_COLUMNS
+    )
+
+    display = df[
+        selected_columns
+    ].copy()
+
+    display = format_display(
+        display
+    )
+
+    for column in ["Entry Timestamp", "Exit Timestamp"]:
+        if column in display.columns:
+            display[column] = display[column].map(
+                lambda x: (
+                    pd.Timestamp(x).strftime("%H:%M:%S")
+                    if pd.notna(x)
+                    else "-"
+                )
+            )
+
+    print(
+        display.to_string(
+            index=False
+        )
+    )
+
+
+# ====================================================================
+# SHORT DETAIL
+# ====================================================================
+
+def print_short_detail(
+    df: pd.DataFrame
+) -> None:
+
+    if df.empty:
+
+        return
+
+    print()
+
+    print(
+        "=" * 110
+    )
+
+    print(
+        "SHORT SETUP QUALITY"
+    )
+
+    print(
+        "=" * 110
+    )
+
+    for _, row in df.head(
+        TOP_SHORTS_TO_SHOW
+    ).iterrows():
+
+        rsi_text = (
+            f"{row['RSI']:.1f}"
+            if pd.notna(
+                row["RSI"]
+            )
+            else "-"
+        )
+
+        print(
+
+            f"{row['Ticker']:12s} | "
+            f"Score {row['Score']:5.1f} | "
+            f"Short {row['Short Score']:5.1f} | "
+            f"RSI {rsi_text:>5s} | "
+            f"RVOL "
+            f"{row['Confirmation RVOL']:.2f}x"
+            if pd.notna(
+                row["Confirmation RVOL"]
+            )
+            else
+            f"{row['Ticker']:12s} | "
+            f"Score {row['Score']:5.1f}"
+        )
+
+        flags = row.get(
+            "Exhaustion Flags",
+            ""
+        )
+
+        if flags:
+
+            print(
+                f"    Exhaustion: "
+                f"{flags}"
+            )
+
+        else:
+
+            print(
+                "    Exhaustion: none"
+            )
+
+
+# ====================================================================
+# EQUITY CURVE
+# ====================================================================
+
+def calculate_exit_sequence_drawdown(evaluated: pd.DataFrame) -> float:
+    """Closed-trade drawdown in chronological exit order.
+
+    This is not a portfolio mark-to-market drawdown because the current
+    scanner does not model concurrent position sizing or intratrade equity.
+    """
+    if evaluated.empty:
+        return np.nan
+
+    ordered = evaluated.copy()
+    if "Exit Timestamp" in ordered.columns:
+        ordered = ordered.sort_values(
+            ["Exit Timestamp", "Entry Timestamp"],
+            na_position="last",
+        )
+    equity = (1 + ordered["Net Return"].fillna(0) / 100).cumprod()
+    running_max = equity.cummax()
+    return float((equity / running_max - 1).min() * 100)
+
+
+# ====================================================================
+# HISTORICAL RESULTS
+# ====================================================================
+
+def print_historical_results(
+    df: pd.DataFrame
+) -> None:
+
+    print()
+
+    print(
+        "=" * 140
+    )
+
+    print(
+        "HISTORICAL POST-09:45 EVALUATION"
+    )
+
+    print(
+        "=" * 140
+    )
+
+    if df.empty:
+
+        print(
+            "No LONG/SHORT signals to evaluate."
+        )
+
+        return
+
+    columns = [
+
+        "Ticker",
+
+        "Signal",
+
+        "Score",
+
+        "Opening %",
+
+        "09:30-09:45 %",
+
+        "Total %",
+
+        "MFE",
+
+        "MAE",
+
+        "Outcome",
+
+        "Gross Return",
+
+        "Net Return",
+        "Entry Timestamp",
+        "Exit Timestamp",
+    ]
+
+    display = df[
+        columns
+    ].copy()
+
+    for column in [
+
+        "Opening %",
+
+        "09:30-09:45 %",
+
+        "Total %",
+
+        "MFE",
+
+        "MAE",
+
+        "Gross Return",
+
+        "Net Return",
+    ]:
+
+        display[column] = display[
+            column
+        ].map(
+
+            lambda x:
+            (
+                f"{x:+.2f}%"
+                if pd.notna(x)
+                else "-"
+            )
+        )
+
+    display["Score"] = display[
+        "Score"
+    ].map(
+
+        lambda x:
+        (
+            f"{x:.0f}"
+            if pd.notna(x)
+            else "-"
+        )
+    )
+
+    print(
+        display.to_string(
+            index=False
+        )
+    )
+
+    # ============================================================
+    # STATISTICS
+    # ============================================================
+
+    evaluated = df[
+        df["Net Return"].notna()
+    ].copy()
+
+    if evaluated.empty:
+
+        return
+
+    total = len(
+        evaluated
+    )
+
+    wins = (
+        evaluated[
+            "Net Return"
+        ]
+        > 0
+    ).sum()
+
+    losses = (
+        evaluated[
+            "Net Return"
+        ]
+        <= 0
+    ).sum()
+
+    win_rate = (
+        wins / total * 100
+        if total > 0
+        else np.nan
+    )
+
+    avg_return = (
+        evaluated[
+            "Net Return"
+        ].mean()
+    )
+
+    avg_win = (
+        evaluated.loc[
+            evaluated["Net Return"] > 0,
+            "Net Return"
+        ].mean()
+    )
+
+    avg_loss = (
+        evaluated.loc[
+            evaluated["Net Return"] <= 0,
+            "Net Return"
+        ].mean()
+    )
+
+    gross_profit = (
+        evaluated.loc[
+            evaluated["Net Return"] > 0,
+            "Net Return"
+        ].sum()
+    )
+
+    gross_loss = abs(
+        evaluated.loc[
+            evaluated["Net Return"] <= 0,
+            "Net Return"
+        ].sum()
+    )
+
+    profit_factor = (
+        gross_profit
+        /
+        gross_loss
+        if gross_loss > 0
+        else np.inf
+    )
+
+    expectancy = avg_return
+
+    max_drawdown = calculate_exit_sequence_drawdown(evaluated)
+
+    print()
+
+    print(
+        "-" * 80
+    )
+
+    print(
+        "PERFORMANCE STATISTICS"
+    )
+
+    print(
+        "-" * 80
+    )
+
+    print(
+        f"Signals evaluated : {total}"
+    )
+
+    print(
+        f"Winners           : {wins}"
+    )
+
+    print(
+        f"Losers            : {losses}"
+    )
+
+    print(
+        f"Win rate          : {win_rate:.2f}%"
+    )
+
+    print(
+        f"Average trade     : {avg_return:+.3f}%"
+    )
+
+    print(
+        f"Average winner    : "
+        f"{avg_win:+.3f}%"
+    )
+
+    print(
+        f"Average loser     : "
+        f"{avg_loss:+.3f}%"
+    )
+
+    print(
+        f"Expectancy        : "
+        f"{expectancy:+.3f}%"
+    )
+
+    print(
+        f"Profit factor     : "
+        f"{profit_factor:.2f}"
+    )
+
+    print(
+        f"Exit-seq drawdown : "
+        f"{max_drawdown:.2f}%"
+    )
+
+    print(
+        "NOTE: this is not a true portfolio mark-to-market drawdown."
+    )
+
+    if evaluated["MFE"].notna().any():
+
+        print(
+            f"Average MFE       : "
+            f"{evaluated['MFE'].mean():+.2f}%"
+        )
+
+    if evaluated["MAE"].notna().any():
+
+        print(
+            f"Average MAE       : "
+            f"{evaluated['MAE'].mean():+.2f}%"
+        )
+
+    print()
+
+    print(
+        f"Assumed trading cost : "
+        f"{COST_MODEL.round_trip_cost_pct:.3f}%"
+    )
+
+    print(
+        f"Assumed slippage     : "
+        f"{COST_MODEL.total_slippage_pct:.3f}%"
+    )
+
+    print(
+        f"Total assumed cost   : "
+        f"{COST_MODEL.total_cost_pct:.3f}%"
+    )
+
+
+# ====================================================================
+# SCAN ONE DATE
+# ====================================================================
+
+def scan_date(
+    target_date: pd.Timestamp,
+    historical: bool = False,
+    rolling_live: bool = False,
+    as_of: Optional[pd.Timestamp] = None
+) -> pd.DataFrame:
+
+    tickers = build_universe()
+
+    # ------------------------------------------------------------
+    # Benchmark
+    # ------------------------------------------------------------
+
+    print(
+        "Downloading NIFTY 50 benchmark..."
+    )
+
+    now_local = pd.Timestamp.now(tz=MARKET_TZ)
+    live_mode = (
+        not historical
+        and target_date.date() == now_local.date()
+        and is_market_open_now(now_local)
+    )
+
+    nifty = download_nifty_data(
+        target_date,
+        live_mode=live_mode,
+    )
+
+    if nifty.empty:
+        fetch_stats = get_fetch_stats()
+        print(
+            "NIFTY DATA DIAGNOSTIC: "
+            f"mode={'INTRADAY+HISTORICAL' if live_mode else 'HISTORICAL'}, "
+            f"target_date={target_date:%Y-%m-%d}, "
+            f"requests={fetch_stats['requests']}, "
+            f"errors={fetch_stats['errors']}, "
+            f"historical_errors={fetch_stats['historical_errors']}, "
+            f"intraday_errors={fetch_stats['intraday_errors']}"
+        )
+        for sample in fetch_stats.get("error_samples", []):
+            if sample.get("instrument_key") == NIFTY50_TICKER:
+                print(
+                    "NIFTY FETCH ERROR: "
+                    f"{sample['type']}: {sample['error']}"
+                )
+
+    if rolling_live:
+
+        if as_of is None:
+
+            as_of = pd.Timestamp.now(
+                tz=MARKET_TZ
+            )
+
+        nifty_pair = get_last_completed_session_pair(
+            nifty,
+            target_date,
+            as_of
+        )
+
+        if nifty_pair is None:
+
+            nifty_opening_return = np.nan
+
+            nifty_total_return = np.nan
+
+            nifty_first_timestamp = None
+
+            nifty_second_timestamp = None
+
+        else:
+
+            nifty_first, nifty_second = nifty_pair
+
+            nifty_first_timestamp = nifty_first.name
+
+            nifty_second_timestamp = nifty_second.name
+
+            (
+                nifty_opening_return,
+                nifty_total_return
+            ) = calculate_market_returns_for_pair(
+                nifty,
+                target_date,
+                nifty_first_timestamp,
+                nifty_second_timestamp
+            )
+
+        if np.isfinite(
+            nifty_total_return
+        ):
+
+            print(
+                f"NIFTY 50 rolling 30m return "
+                f"({nifty_first_timestamp:%H:%M}-"
+                f"{nifty_second_timestamp + pd.Timedelta(minutes=15):%H:%M}): "
+                f"{nifty_total_return:+.2f}%"
+            )
+
+        else:
+
+            print(
+                "WARNING: NIFTY benchmark unavailable "
+                "for the latest completed window."
+            )
+
+    else:
+
+        (
+            nifty_opening_return,
+            nifty_total_return
+        ) = calculate_market_returns(
+            nifty,
+            target_date
+        )
+
+        nifty_first_timestamp = None
+
+        nifty_second_timestamp = None
+
+        if np.isfinite(
+            nifty_total_return
+        ):
+
+            print(
+                f"NIFTY 50 09:45 return: "
+                f"{nifty_total_return:+.2f}%"
+            )
+
+        else:
+
+            print(
+                "WARNING: NIFTY benchmark unavailable."
+            )
+
+    # ------------------------------------------------------------
+    # Scan
+    # ------------------------------------------------------------
+
+    all_results = []
+
+    total = len(
+        tickers
+    )
+
+    processed = 0
+
+    for start_idx in range(
+        0,
+        total,
+        BATCH_SIZE
+    ):
+
+        batch = tickers[
+            start_idx:
+            start_idx + BATCH_SIZE
+        ]
+
+        batch_data = (
+            download_intraday_batch(
+                batch,
+                target_date,
+                live_mode=live_mode,
+            )
+        )
+
+        for ticker in batch:
+
+            processed += 1
+
+            progress_line(
+
+                f"Scanning "
+                f"{processed}/{total} | "
+                f"Signals: "
+                f"{len(all_results)}"
+            )
+
+            try:
+
+                raw_df = batch_data.get(
+                    ticker
+                )
+
+                if raw_df is None:
+
+                    _record_scan_stat("missing_data")
+                    continue
+
+                if rolling_live:
+
+                    stock_pair = get_last_completed_session_pair(
+                        raw_df,
+                        target_date,
+                        as_of
+                    )
+
+                    if stock_pair is None:
+
+                        _record_scan_stat("window_failures")
+                        continue
+
+                    stock_first, stock_second = stock_pair
+
+                    # Keep every stock on the same completed 15-minute
+                    # window as the benchmark.
+                    if (
+                        nifty_second_timestamp is not None
+                        and stock_second.name
+                        != nifty_second_timestamp
+                    ):
+
+                        continue
+
+                analysis = (
+                    analyse_at_0945(
+
+                        ticker,
+
+                        raw_df,
+
+                        target_date,
+
+                        nifty_opening_return,
+
+                        nifty_total_return,
+
+                        rolling_live=rolling_live,
+                        nifty_df=nifty,
+                    )
+                )
+
+                if analysis is None:
+
+                    continue
+
+                # ------------------------------------------------
+                # Liquidity
+                # ------------------------------------------------
+
+                median_daily_turnover = analysis.get(
+                    "Median Daily Turnover Cr",
+                    np.nan,
+                )
+
+                median_daily_volume_lakh = analysis.get(
+                    "Median Daily Volume Lakh",
+                    np.nan,
+                )
+
+                # Require both traded-value capacity and a price-neutral
+                # share-volume floor. This prevents very expensive stocks
+                # from passing on rupee turnover alone.
+                if (
+                    not np.isfinite(median_daily_turnover)
+                    or not np.isfinite(median_daily_volume_lakh)
+                    or median_daily_turnover < MIN_MEDIAN_DAILY_TURNOVER_CR
+                    or median_daily_volume_lakh < MIN_MEDIAN_DAILY_VOLUME_LAKH
+                ):
+                    continue
+
+                # ------------------------------------------------
+                # Only actionable signals
+                # ------------------------------------------------
+
+                if (
+                    analysis[
+                        "Signal"
+                    ]
+                    not in (
+                        "LONG",
+                        "SHORT"
+                    )
+                ):
+
+                    continue
+
+                # ------------------------------------------------
+                # Historical outcome
+                # ------------------------------------------------
+
+                if historical:
+
+                    evaluation = (
+                        calculate_historical_outcome(
+
+                            analysis,
+
+                            raw_df,
+
+                            target_date,
+                        )
+                    )
+
+                else:
+
+                    evaluation = {
+
+                        "MFE":
+                            np.nan,
+
+                        "MAE":
+                            np.nan,
+
+                        "Outcome":
+                            "LIVE",
+
+                        "Target":
+                            np.nan,
+
+                        "Stop":
+                            np.nan,
+
+                        "Gross Return":
+                            np.nan,
+
+                        "Net Return":
+                            np.nan,
+
+                        "Bars Held":
+                            np.nan,
+                    }
+
+                result = {
+
+                    key: value
+
+                    for key, value
+
+                    in analysis.items()
+
+                    if key != "_Data"
+                }
+
+                result.update(
+                    evaluation
+                )
+
+                all_results.append(
+                    result
+                )
+
+            except Exception as exc:
+
+                _record_scan_error(ticker, "scan_ticker", str(exc))
+                continue
+
+        time.sleep(
+            BATCH_DELAY
+        )
+
+    clear_line()
+
+    fetch_stats = get_fetch_stats()
+    scan_stats = get_scan_stats()
+
+    if (
+        fetch_stats["errors"]
+        or fetch_stats["historical_errors"]
+        or fetch_stats["intraday_errors"]
+        or scan_stats["ticker_exceptions"]
+        or scan_stats["missing_data"]
+        or scan_stats["window_failures"]
+    ):
+        print()
+        print(
+            "DATA FETCH SUMMARY: "
+            f"requests={fetch_stats['requests']}, "
+            f"errors={fetch_stats['errors']}, "
+            f"historical_errors={fetch_stats['historical_errors']}, "
+            f"intraday_errors={fetch_stats['intraday_errors']}, "
+            f"ticker_exceptions={scan_stats['ticker_exceptions']}, "
+            f"missing_data={scan_stats['missing_data']}, "
+            f"window_failures={scan_stats['window_failures']}"
+        )
+
+        for sample in fetch_stats.get("error_samples", []):
+            print(
+                "FETCH ERROR: "
+                f"{sample['type']} "
+                f"{sample['instrument_key']}: "
+                f"{sample['error']}"
+            )
+
+        for sample in scan_stats.get("scan_error_samples", []):
+            print(
+                "SCAN ERROR: "
+                f"{sample['ticker']} "
+                f"[{sample['stage']}]: "
+                f"{sample['error']}"
+            )
+
+    if not all_results:
+
+        return pd.DataFrame()
+
+    results = pd.DataFrame(
+        all_results
+    )
+
+    # ------------------------------------------------------------
+    # Rank by signal-specific score.
+    # ------------------------------------------------------------
+
+    results["Rank Score"] = np.where(
+
+        results["Signal"] == "SHORT",
+
+        results["Short Score"],
+
+        results["Long Score"]
+    )
+
+    results = results.sort_values(
+
+        "Rank Score",
+
+        ascending=False
+    ).reset_index(
+        drop=True
+    )
+
+    if rolling_live and not results.empty:
+
+        latest_timestamp = results[
+            "Decision Timestamp"
+        ].max()
+
+        results[
+            "Live Window End"
+        ] = latest_timestamp
+
+        results[
+            "Live Window Start"
+        ] = (
+            latest_timestamp
+            -
+            pd.Timedelta(minutes=30)
+        )
+
+    fetch_stats = get_fetch_stats()
+    scan_stats = get_scan_stats()
+    if (
+        fetch_stats["errors"]
+        or fetch_stats["historical_errors"]
+        or fetch_stats["intraday_errors"]
+        or scan_stats["ticker_exceptions"]
+        or scan_stats["missing_data"]
+        or scan_stats["window_failures"]
+    ):
+        print(
+            "DATA FETCH SUMMARY: "
+            f"requests={fetch_stats['requests']}, "
+            f"errors={fetch_stats['errors']}, "
+            f"historical_errors={fetch_stats['historical_errors']}, "
+            f"intraday_errors={fetch_stats['intraday_errors']}"
+        )
+
+        for sample in fetch_stats.get("error_samples", []):
+            print(
+                "FETCH ERROR: "
+                f"{sample['type']} "
+                f"{sample['instrument_key']}: "
+                f"{sample['error']}"
+            )
+
+        print(
+            "SCAN DATA QUALITY: "
+            f"ticker_exceptions={scan_stats['ticker_exceptions']}, "
+            f"missing_data={scan_stats['missing_data']}, "
+            f"window_failures={scan_stats['window_failures']}"
+        )
+
+        for sample in scan_stats.get("scan_error_samples", []):
+            print(
+                "SCAN ERROR: "
+                f"{sample['ticker']} "
+                f"[{sample['stage']}]: "
+                f"{sample['error']}"
+            )
+
+    return results
+
+
+# ====================================================================
+# HISTORICAL DATE-RANGE RUNNER
+# ====================================================================
+
+def scan_historical_range(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+    if end_date < start_date:
+        raise ValueError("End date must be on or after start date.")
+
+    dates = [
+        pd.Timestamp(d).normalize()
+        for d in pd.date_range(start_date, end_date, freq="D")
+        if pd.Timestamp(d).weekday() < 5
+    ]
+
+    if not dates:
+        return pd.DataFrame()
+
+    frames: List[pd.DataFrame] = []
+
+    print()
+    print("=" * 100)
+    print(f"HISTORICAL RANGE: {start_date:%Y-%m-%d} -> {end_date:%Y-%m-%d}")
+    print("=" * 100)
+
+    for i, target in enumerate(dates, start=1):
+        print()
+        print(f"[{i}/{len(dates)}] {target:%Y-%m-%d}")
+
+        day_results = scan_date(
+            target,
+            historical=True,
+            rolling_live=False,
+        )
+
+        if not day_results.empty:
+            day_results = day_results.copy()
+            day_results["Scan Date"] = target
+            frames.append(day_results)
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True)
+
+    # Chronological ordering is mandatory for research statistics.
+    combined = combined.sort_values(
+        ["Entry Timestamp", "Exit Timestamp", "Ticker"],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    return combined
+
+
+# ====================================================================
+# SCORE CALIBRATION SUMMARY
+# ====================================================================
+
+def print_score_calibration(df: pd.DataFrame) -> None:
+    if df.empty or "Net Return" not in df.columns:
+        return
+
+    evaluated = df[df["Net Return"].notna()].copy()
+    if evaluated.empty:
+        return
+
+    print()
+    print("=" * 100)
+    print("EMPIRICAL SCORE CALIBRATION - DESCRIPTIVE ONLY")
+    print("=" * 100)
+
+    print("Scores are not probabilities; this table shows observed outcomes by score band.")
+
+    bins = [0, 50, 60, 65, 70, 75, 80, 85, 90, 100.000001]
+    labels = ["<50", "50-59", "60-64", "65-69", "70-74", "75-79", "80-84", "85-89", "90+"]
+
+    evaluated["Score Band"] = pd.cut(
+        evaluated["Score"],
+        bins=bins,
+        labels=labels,
+        right=False,
+        include_lowest=True,
+    )
+
+    summary = (
+        evaluated
+        .groupby(["Signal", "Score Band"], observed=False)
+        .agg(
+            Trades=("Net Return", "size"),
+            WinRate=("Net Return", lambda x: (x > 0).mean() * 100),
+            AvgNet=("Net Return", "mean"),
+        )
+        .reset_index()
+    )
+
+    summary["WinRate"] = summary["WinRate"].map(lambda x: f"{x:.1f}%")
+    summary["AvgNet"] = summary["AvgNet"].map(lambda x: f"{x:+.3f}%")
+    print(summary.to_string(index=False))
+
+
+# ====================================================================
+# SHOW RESULTS
+# ====================================================================
+
+def show_results(
+    results: pd.DataFrame,
+    historical: bool,
+    rolling_live: bool = False
+) -> None:
+
+    if results.empty:
+
+        print()
+
+        print(
+            "=" * 100
+        )
+
+        print(
+            "NO ACTIONABLE SIGNALS"
+        )
+
+        print(
+            "=" * 100
+        )
+
+        print(
+            "No stock passed the V4 criteria."
+        )
+
+        return
+
+    # ============================================================
+    # SHORTS
+    # ============================================================
+
+    shorts = results[
+        results["Signal"]
+        == "SHORT"
+    ].copy()
+
+    shorts = shorts.sort_values(
+        "Short Score",
+        ascending=False
+    ).head(
+        TOP_SHORTS_TO_SHOW
+    ).copy()
+
+    shorts["Rank"] = range(
+        1,
+        len(shorts) + 1
+    )
+
+    # ============================================================
+    # LONGS
+    # ============================================================
+
+    longs = results[
+        results["Signal"]
+        == "LONG"
+    ].copy()
+
+    longs = longs.sort_values(
+        "Long Score",
+        ascending=False
+    ).head(
+        TOP_LONGS_TO_SHOW
+    ).copy()
+
+    longs["Rank"] = range(
+        1,
+        len(longs) + 1
+    )
+
+    # ============================================================
+    # PRINT
+    # ============================================================
+
+    rolling_display_columns = [
+
+        "Rank",
+        "Ticker",
+        "Signal",
+        "Conviction",
+        "Score",
+        "First 15m %",
+        "Last 15m %",
+        "Window %",
+        "Relative Total %",
+        "Beta Adjusted Alpha %",
+        "Market Beta",
+        "Price",
+        "VWAP %",
+        "EMA20 %",
+        "Opening RVOL",
+        "Confirmation RVOL",
+        "RSI",
+        "MACD",
+        "Turnover Cr",
+        "Median Daily Turnover Cr",
+        "Median Daily Volume Lakh",
+        "Window Start",
+        "Window End",
+    ]
+
+    display_columns = (
+        rolling_display_columns
+        if rolling_live
+        else DISPLAY_COLUMNS
+    )
+
+    print_table(
+        "🔴 TOP SHORT CANDIDATES - V4",
+        shorts,
+        columns=display_columns
+    )
+
+    print_short_detail(
+        shorts
+    )
+
+    print_table(
+        "🟢 TOP LONG CANDIDATES - V4",
+        longs,
+        columns=display_columns
+    )
+
+    # ============================================================
+    # HISTORICAL
+    # ============================================================
+
+    if historical:
+
+        evaluation_df = results[
+            results["Signal"].isin(
+                [
+                    "LONG",
+                    "SHORT"
+                ]
+            )
+        ].copy()
+
+        print_historical_results(
+            evaluation_df
+        )
+
+    # ============================================================
+    # EXPORT
+    # ============================================================
+
+    if EXPORT_RESULTS:
+
+        try:
+
+            results.to_csv(
+                EXPORT_FILENAME,
+                index=False
+            )
+
+            print()
+
+            print(
+                f"Results exported to: "
+                f"{EXPORT_FILENAME}"
+            )
+
+        except Exception as exc:
+
+            print(
+                f"CSV export failed: "
+                f"{exc}"
+            )
+
+
+# ====================================================================
+# MODE
+# ====================================================================
+
+def select_mode() -> Tuple[
+    str,
+    pd.Timestamp,
+    Optional[pd.Timestamp]
+]:
+
+    print()
+
+    print(
+        "=" * 90
+    )
+
+    print(
+        "NSE 09:45 SHORT-BIASED INTRADAY SCANNER V4 - UPSTOX DATA"
+    )
+
+    print(
+        "=" * 90
+    )
+
+    print()
+
+    print(
+        "1. Historical date"
+    )
+
+    print(
+        "2. Live today - fixed 09:15 to 09:45 scanner"
+    )
+
+    print(
+        "3. Live today - latest completed 15-minute window"
+    )
+
+    print(
+        "4. Historical date range"
+    )
+
+    print()
+
+    choice = input(
+        "Choice [1/2/3/4]: "
+    ).strip()
+
+    if choice == "1":
+
+        target_date = ask_date()
+
+        return (
+            "historical",
+            target_date,
+            None,
+        )
+
+    if choice == "2":
+
+        now = pd.Timestamp.now(
+            tz=MARKET_TZ
+        )
+
+        target_date = (
+            now
+            .tz_localize(None)
+            .normalize()
+        )
+
+        return (
+            "live",
+            target_date,
+            None,
+        )
+
+    if choice == "3":
+
+        now = pd.Timestamp.now(
+            tz=MARKET_TZ
+        )
+
+        target_date = (
+            now
+            .tz_localize(None)
+            .normalize()
+        )
+
+        return (
+            "live_rolling",
+            target_date,
+            None,
+        )
+
+    if choice == "4":
+
+        start_date = ask_date()
+        end_date = ask_date()
+
+        if end_date < start_date:
+            print("End date must be on or after start date.")
+            sys.exit(1)
+
+        return (
+            "historical_range",
+            start_date,
+            end_date,
+        )
+
+    print(
+        "Invalid choice."
+    )
+
+    sys.exit(1)
+
+
+# ====================================================================
+# LIVE / OFF-HOURS SESSION RESOLUTION
+# ====================================================================
+
+def is_market_open_now(now: pd.Timestamp) -> bool:
+    market_open = datetime.strptime(MARKET_OPEN, "%H:%M").time()
+    market_close = datetime.strptime(MARKET_CLOSE, "%H:%M").time()
+    return market_open <= now.time() < market_close and now.weekday() < 5
+
+
+def resolve_latest_trading_session_date(
+    reference_date: pd.Timestamp,
+) -> pd.Timestamp:
+    """Resolve the latest completed trading session with usable NIFTY candles."""
+    end_date = reference_date.normalize()
+    start_date = end_date - pd.Timedelta(days=OFF_HOURS_LOOKBACK_DAYS)
+
+    try:
+        df = download_upstox_historical(
+            NIFTY50_TICKER,
+            end_date,
+            from_date=start_date,
+            interval_minutes=UPSTOX_INTERVAL_MINUTES,
+        )
+    except Exception as exc:
+        _record_scan_error(
+            "NIFTY",
+            "off_hours_session_resolution",
+            str(exc),
+        )
+        return reference_date.normalize()
+
+    if df.empty:
+        return reference_date.normalize()
+
+    # Search newest session first, requiring the first two 15-minute bars.
+    dates = sorted(
+        {pd.Timestamp(ts).date() for ts in df.index},
+        reverse=True,
+    )
+
+    for session_date in dates:
+        session_ts = pd.Timestamp(session_date).normalize()
+        session = filter_session(df, session_ts)
+
+        if len(session) >= 2:
+            return session_ts
+
+    return reference_date.normalize()
+
+
+# ====================================================================
+# LIVE TIME CHECK
+# ====================================================================
+
+def check_live_time(
+    target_date: pd.Timestamp
+) -> None:
+
+    now = pd.Timestamp.now(
+        tz=MARKET_TZ
+    )
+
+    if (
+        now.date()
+        != target_date.date()
+    ):
+
+        return
+
+    market_time = now.time()
+
+    decision_time = datetime.strptime(
+        DECISION_TIME,
+        "%H:%M"
+    ).time()
+
+    if market_time < decision_time:
+
+        print()
+
+        print(
+            "WARNING:"
+        )
+
+        print(
+            "The scanner is designed "
+            "for use after 09:45 AM IST."
+        )
+
+        print(
+            f"Current time: "
+            f"{now.strftime('%H:%M:%S')} IST"
+        )
+
+        print()
+
+
+# ====================================================================
+# LIVE ROLLING TIME CHECK
+# ====================================================================
+
+def check_live_rolling_time(
+    target_date: pd.Timestamp
+) -> pd.Timestamp:
+
+    now = pd.Timestamp.now(
+        tz=MARKET_TZ
+    )
+
+    if now.date() != target_date.date():
+
+        return now
+
+    market_open = datetime.strptime(
+        MARKET_OPEN,
+        "%H:%M"
+    ).time()
+
+    minimum_pair_time = datetime.strptime(
+        "09:45",
+        "%H:%M"
+    ).time()
+
+    market_close = datetime.strptime(
+        MARKET_CLOSE,
+        "%H:%M"
+    ).time()
+
+    if now.time() < minimum_pair_time:
+
+        print()
+
+        print(
+            "WARNING:"
+        )
+
+        print(
+            "Rolling scanner needs at least two completed "
+            "15-minute candles."
+        )
+
+        print(
+            "Start it at or after 09:45 AM IST."
+        )
+
+        print(
+            f"Current time: {now.strftime('%H:%M:%S')} IST"
+        )
+
+        print()
+
+    elif now.time() > market_close:
+
+        print()
+
+        print(
+            "WARNING:"
+        )
+
+        print(
+            "Market is closed. The rolling scanner will use "
+            "the latest completed candle from today's session."
+        )
+
+        print(
+            f"Current time: {now.strftime('%H:%M:%S')} IST"
+        )
+
+        print()
+
+    elif now.time() < market_open:
+
+        print(
+            "Market has not opened yet."
+        )
+
+    return now
+
+
+# ====================================================================
+# SUMMARY
+# ====================================================================
+
+def print_summary(
+    results: pd.DataFrame
+) -> None:
+
+    print()
+
+    print(
+        "=" * 90
+    )
+
+    print(
+        "SUMMARY"
+    )
+
+    print(
+        "=" * 90
+    )
+
+    if results.empty:
+
+        print(
+            "Signals: 0"
+        )
+
+        return
+
+    shorts = results[
+        results["Signal"]
+        == "SHORT"
+    ]
+
+    longs = results[
+        results["Signal"]
+        == "LONG"
+    ]
+
+    high_short = shorts[
+        shorts["Short Score"]
+        >= SHORT_HIGH_CONVICTION_SCORE
+    ]
+
+    high_long = longs[
+        longs["Long Score"]
+        >= LONG_HIGH_CONVICTION_SCORE
+    ]
+
+    print(
+        f"Actionable signals : "
+        f"{len(results)}"
+    )
+
+    print(
+        f"Short signals      : "
+        f"{len(shorts)}"
+    )
+
+    print(
+        f"Long signals       : "
+        f"{len(longs)}"
+    )
+
+    print(
+        f"High-conviction S  : "
+        f"{len(high_short)}"
+    )
+
+    print(
+        f"High-conviction L  : "
+        f"{len(high_long)}"
+    )
+
+    print(
+        f"Displayed shorts   : "
+        f"{min(len(shorts), TOP_SHORTS_TO_SHOW)}"
+    )
+
+    print(
+        f"Displayed longs    : "
+        f"{min(len(longs), TOP_LONGS_TO_SHOW)}"
+    )
+
+    print(
+        "=" * 90
+    )
+
+
+# ====================================================================
+# DATA QUALITY WARNING
+# ====================================================================
+
+def print_data_limitations() -> None:
+
+    print()
+
+    print(
+        "=" * 90
+    )
+
+    print(
+        "DATA / BACKTEST LIMITATIONS"
+    )
+
+    print(
+        "=" * 90
+    )
+
+    print(
+        "1. Upstox V3 1-15 minute history is limited to about one month."
+    )
+
+    print(
+        "2. Historical evaluation beyond that window needs a separate"
+        " institutional data source."
+    )
+
+    print(
+        "3. Current NIFTY constituents create survivorship bias"
+        " for old historical dates."
+    )
+
+    print(
+        "4. Upstox API data should still be validated against"
+        " your intended execution environment."
+    )
+
+    print(
+        "5. Slippage/cost assumptions must be calibrated to"
+        " your actual broker and execution."
+    )
+
+    print(
+        "6. Score is a ranking feature, not a probability estimate."
+    )
+
+    print(
+        "7. Institutional multi-date validation still requires"
+        " historical constituents and a proper data warehouse."
+    )
+
+
+# ====================================================================
+# MAIN
+# ====================================================================
+
+def main() -> None:
+
+    start_time = time.perf_counter()
+
+    try:
+
+        mode, target_date, end_date = (
+            select_mode()
+        )
+
+        historical = (
+            mode in ("historical", "historical_range")
+        )
+
+        historical_range = (
+            mode == "historical_range"
+        )
+
+        rolling_live = (
+            mode == "live_rolling"
+        )
+
+        live_as_of = None
+
+        print()
+
+        if historical_range:
+
+            print(
+                f"Historical range: {target_date:%Y-%m-%d} -> {end_date:%Y-%m-%d}"
+            )
+
+        elif historical:
+
+            print(
+                f"Historical scan: "
+                f"{target_date:%Y-%m-%d}"
+            )
+
+        elif rolling_live:
+
+            live_as_of = check_live_rolling_time(
+                target_date
+            )
+
+            if ALLOW_OFF_HOURS_LIVE_FALLBACK and not is_market_open_now(live_as_of):
+                resolved = resolve_latest_trading_session_date(target_date)
+                if resolved.date() != target_date.date():
+                    target_date = resolved
+                    print(
+                        f"Off-hours mode: using latest completed trading session "
+                        f"{target_date:%Y-%m-%d}"
+                    )
+
+            print(
+                f"Live rolling scan: "
+                f"{target_date:%Y-%m-%d}"
+            )
+
+        else:
+
+            now = pd.Timestamp.now(tz=MARKET_TZ)
+
+            if ALLOW_OFF_HOURS_LIVE_FALLBACK and not is_market_open_now(now):
+                resolved = resolve_latest_trading_session_date(target_date)
+                if resolved.date() != target_date.date():
+                    target_date = resolved
+                    print(
+                        f"Off-hours mode: using latest completed trading session "
+                        f"{target_date:%Y-%m-%d}"
+                    )
+
+            print(
+                f"Live scan: "
+                f"{target_date:%Y-%m-%d}"
+            )
+
+            check_live_time(
+                target_date
+            )
+
+            # Fixed 09:15-09:45 mode is not meaningful before the
+            # 09:45 candle has fully completed.
+            now_check = pd.Timestamp.now(tz=MARKET_TZ)
+            if (
+                target_date.date() == now_check.date()
+                and is_market_open_now(now_check)
+                and now_check.time() < datetime.strptime(DECISION_TIME, "%H:%M").time()
+            ):
+                print(
+                    "FIXED LIVE SCAN BLOCKED: "
+                    "the 09:15-09:45 signal window is not complete yet."
+                )
+                print(
+                    "Use rolling mode after two completed 15-minute candles, "
+                    "or run fixed mode at/after 09:45 IST."
+                )
+                return
+
+        print()
+
+        print(
+            "V4 FEATURES / DATA:"
+        )
+
+        print(
+            "Upstox V3 NSE market data"
+        )
+
+        print(
+            "Historical EMA9 / EMA20 warm-up"
+        )
+
+        print(
+            "Historical RSI / MACD / ATR warm-up"
+        )
+
+        print(
+            "Session VWAP"
+        )
+
+        print(
+            "Same-time-of-day relative volume"
+        )
+
+        print(
+            "NIFTY-relative strength"
+        )
+
+        print(
+            "ATR-normalized movement"
+        )
+
+        print(
+            "Continuous scoring"
+        )
+
+        print(
+            "Reduced correlated feature double-counting"
+        )
+
+        print(
+            "Exhaustion protection"
+        )
+
+        print(
+            "Transaction cost + slippage model"
+        )
+
+        if historical:
+
+            if USE_1M_EVALUATION:
+
+                print(
+                    "1-minute post-entry evaluation"
+                )
+
+            else:
+
+                print(
+                    "15-minute post-entry evaluation"
+                )
+
+        print()
+
+        if rolling_live:
+
+            print(
+                "Latest completed 15-minute window"
+            )
+
+            print(
+                "Same VWAP / EMA / RSI / MACD / ATR / RVOL "
+                "and scoring engine"
+            )
+
+            print(
+                "Benchmark aligned to the same completed window"
+            )
+
+        if historical_range:
+            results = scan_historical_range(
+                target_date,
+                end_date,
+            )
+        else:
+            results = scan_date(
+                target_date,
+                historical=historical,
+                rolling_live=rolling_live,
+                as_of=live_as_of,
+            )
+
+        show_results(
+
+            results,
+
+            historical=historical,
+
+            rolling_live=rolling_live
+        )
+
+        print_summary(
+            results
+        )
+
+        if historical_range:
+            print_score_calibration(results)
+
+        print_data_limitations()
+
+        elapsed = (
+            time.perf_counter()
+            -
+            start_time
+        )
+
+        print()
+
+        print(
+            f"Runtime: "
+            f"{elapsed:.1f}s"
+        )
+
+        print()
+
+        print(
+            "IMPORTANT:"
+        )
+
+        print(
+            "V4 is a research/scanning system with corrected entry-time evaluation."
+        )
+
+        print(
+            "A high score does not guarantee"
+            " a profitable trade."
+        )
+
+    except KeyboardInterrupt:
+
+        print()
+
+        print(
+            "Scanner stopped by user."
+        )
+
+        sys.exit(0)
+
+    except Exception as exc:
+
+        print()
+
+        print(
+            f"Fatal error: {exc}"
+        )
+
+        sys.exit(1)
+
+
+# ====================================================================
+# ENTRY POINT
+# ====================================================================
+
+if __name__ == "__main__":
+
+    main()
